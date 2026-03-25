@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Polymarket BTC 5m Arb Bot</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0d1117; color: #c9d1d9; font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 14px; padding: 12px; min-height: 100vh;
+  }
+  .header {
+    background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+    padding: 12px 20px; margin-bottom: 12px; text-align: center;
+  }
+  .header h1 { font-size: 16px; color: #58a6ff; margin-bottom: 6px; }
+  .header .status-bar { font-size: 13px; }
+  .mode-paper { color: #3fb950; font-weight: bold; }
+  .mode-live { color: #f85149; font-weight: bold; }
+  .feed-ok { color: #3fb950; }
+  .feed-down { color: #f85149; }
+  .grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+  }
+  @media (max-width: 768px) { .grid { grid-template-columns: 1fr; } }
+  .panel {
+    background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+    padding: 14px; min-height: 120px;
+  }
+  .panel-title {
+    font-size: 12px; color: #8b949e; text-transform: uppercase;
+    letter-spacing: 1px; margin-bottom: 10px; border-bottom: 1px solid #21262d;
+    padding-bottom: 6px;
+  }
+  .row { display: flex; justify-content: space-between; padding: 3px 0; }
+  .label { color: #8b949e; }
+  .value { color: #c9d1d9; font-weight: bold; }
+  .green { color: #3fb950; }
+  .red { color: #f85149; }
+  .yellow { color: #d29922; }
+  .blue { color: #58a6ff; }
+  .dim { color: #484f58; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { color: #8b949e; text-align: left; padding: 4px 8px; border-bottom: 1px solid #21262d; font-weight: normal; font-size: 11px; text-transform: uppercase; }
+  td { padding: 4px 8px; }
+  .prob-bar {
+    background: #21262d; border-radius: 3px; height: 14px; margin-top: 6px; overflow: hidden;
+  }
+  .prob-fill { background: #58a6ff; height: 100%; border-radius: 3px; transition: width 0.3s; }
+  .connection-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
+  .dot-ok { background: #3fb950; }
+  .dot-down { background: #f85149; }
+  .footer {
+    margin-top: 12px; text-align: center; font-size: 12px; color: #484f58;
+    padding: 8px;
+  }
+  #conn-status { font-size: 11px; margin-top: 4px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Polymarket BTC 5m Arb Bot</h1>
+  <div class="status-bar">
+    <span id="mode" class="mode-paper">PAPER MODE</span>
+    &nbsp;|&nbsp; Uptime: <span id="uptime">00:00:00</span>
+    &nbsp;|&nbsp;
+    <span class="connection-dot dot-down" id="dot-binance"></span>Binance: <span id="feed-binance" class="feed-down">--</span>
+    &nbsp;
+    <span class="connection-dot dot-down" id="dot-poly"></span>Polymarket: <span id="feed-poly" class="feed-down">--</span>
+    &nbsp;
+    <span class="connection-dot dot-down" id="dot-chain"></span>Chainlink: <span id="feed-chain" class="feed-down">--</span>
+  </div>
+  <div id="conn-status" class="dim">Connecting...</div>
+</div>
+
+<div class="grid">
+  <!-- Market Panel -->
+  <div class="panel">
+    <div class="panel-title">Current Market</div>
+    <div id="market-content">
+      <div class="row"><span class="label">Slug:</span> <span class="value" id="m-slug">--</span></div>
+      <div class="row"><span class="label">Price to Beat:</span> <span class="value" id="m-anchor">--</span></div>
+      <div class="row"><span class="label">Chainlink:</span> <span class="value" id="m-chainlink">--</span> <span id="m-cl-delta"></span></div>
+      <div class="row"><span class="label">Binance:</span> <span class="value" id="m-binance">--</span> <span id="m-delta"></span></div>
+      <div class="row"><span class="label">Time:</span> <span class="value" id="m-time">--</span></div>
+      <div class="row"><span class="label">Phase:</span> <span class="value" id="m-phase">--</span></div>
+    </div>
+  </div>
+
+  <!-- Positions Panel -->
+  <div class="panel">
+    <div class="panel-title">Positions (<span id="pos-count">0</span>)</div>
+    <table>
+      <thead><tr><th>Side</th><th>Qty</th><th>Cost</th><th>Value</th><th>uPnL</th><th>If Win</th></tr></thead>
+      <tbody id="pos-body"><tr><td class="dim" colspan="6">No positions</td></tr></tbody>
+    </table>
+  </div>
+
+  <!-- Strategy Panel -->
+  <div class="panel">
+    <div class="panel-title">Strategy</div>
+    <div class="row"><span class="label">Direction:</span> <span class="value" id="s-dir">-</span> <span id="s-delta" class="dim"></span></div>
+    <div class="row"><span class="label">P(Up):</span> <span class="value" id="s-prob">50.00%</span></div>
+    <div class="prob-bar"><div class="prob-fill" id="s-bar" style="width:50%"></div></div>
+    <div class="row" style="margin-top:8px"><span class="label">Edge:</span> <span class="value" id="s-edge">+0.00%</span> <span class="dim">(min: <span id="s-min-edge">2.00%</span>)</span></div>
+    <div class="row"><span class="label">If correct:</span> <span class="value green" id="s-if-win">--</span> &nbsp; <span class="label">If wrong:</span> <span class="value red" id="s-if-lose">--</span></div>
+  </div>
+
+  <!-- Risk Panel -->
+  <div class="panel">
+    <div class="panel-title">Risk</div>
+    <div class="row"><span class="label">Status:</span> <span class="value" id="r-status">--</span></div>
+    <div class="row"><span class="label">Bankroll:</span> <span class="value" id="r-bankroll">--</span></div>
+    <div class="row"><span class="label">Daily P&L:</span> <span class="value" id="r-pnl">--</span></div>
+    <div class="row"><span class="label">Drawdown:</span> <span class="value" id="r-drawdown">--</span></div>
+    <div class="row"><span class="label">Exposure:</span> <span class="value" id="r-exposure">--</span></div>
+  </div>
+
+  <!-- Orders Panel -->
+  <div class="panel">
+    <div class="panel-title">Open Orders (<span id="ord-count">0</span>)</div>
+    <table>
+      <thead><tr><th>Side</th><th>Price</th><th>Size</th><th>Age(s)</th></tr></thead>
+      <tbody id="ord-body"><tr><td class="dim" colspan="4">No orders</td></tr></tbody>
+    </table>
+  </div>
+
+  <!-- Stats Panel -->
+  <div class="panel">
+    <div class="panel-title">Session Stats</div>
+    <div class="row"><span class="label">Trades:</span> <span class="value" id="st-trades">0</span></div>
+    <div class="row"><span class="label">Win Rate:</span> <span class="value" id="st-winrate">0.0%</span></div>
+    <div class="row"><span class="label">Session P&L:</span> <span class="value" id="st-pnl">$0.00</span></div>
+    <div class="row"><span class="label">Avg Latency:</span> <span class="value" id="st-latency">0ms</span></div>
+    <div class="row"><span class="label">Peak Equity:</span> <span class="value" id="st-peak">$1,000.00</span></div>
+  </div>
+</div>
+
+<div class="footer">
+  <span id="last-update">--</span> &nbsp;|&nbsp; Auto-refreshing via SSE
+</div>
+
+<script>
+function $(id) { return document.getElementById(id); }
+function fmt(n, d=2) { return n != null ? '$' + n.toLocaleString('en-US', {minimumFractionDigits:d, maximumFractionDigits:d}) : '--'; }
+function pct(n) { return (n * 100).toFixed(2) + '%'; }
+function signed(n) { return (n >= 0 ? '+' : '') + '$' + n.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2}); }
+function pnlClass(n) { return n >= 0 ? 'green' : 'red'; }
+
+function feedStatus(ok) {
+  return { text: ok ? 'OK' : 'DOWN', cls: ok ? 'feed-ok' : 'feed-down', dot: ok ? 'dot-ok' : 'dot-down' };
+}
+
+function update(d) {
+  // Header
+  $('mode').textContent = d.mode + ' MODE';
+  $('mode').className = d.mode === 'LIVE' ? 'mode-live' : 'mode-paper';
+  $('uptime').textContent = d.uptime;
+
+  ['binance', 'polymarket', 'chainlink'].forEach((f, i) => {
+    var key = f === 'polymarket' ? 'poly' : f === 'chainlink' ? 'chain' : f;
+    var s = feedStatus(d.feeds[f]);
+    $('feed-' + key).textContent = s.text;
+    $('feed-' + key).className = s.cls;
+    $('dot-' + key).className = 'connection-dot ' + s.dot;
+  });
+
+  // Market
+  var m = d.market;
+  $('m-slug').textContent = m.slug || 'No active market';
+  $('m-anchor').textContent = m.anchor != null ? fmt(m.anchor) : 'Pending...';
+  $('m-chainlink').textContent = m.chainlink_price > 0 ? fmt(m.chainlink_price) : '--';
+  if (m.anchor != null && m.chainlink_price > 0) {
+    var clDelta = m.chainlink_price - m.anchor;
+    var absClDelta = Math.abs(clDelta);
+    if (clDelta > 0) {
+      $('m-cl-delta').innerHTML = '<span class="green">+$' + absClDelta.toFixed(2) + ' (UP)</span>';
+    } else if (clDelta < 0) {
+      $('m-cl-delta').innerHTML = '<span class="red">-$' + absClDelta.toFixed(2) + ' (DOWN)</span>';
+    } else {
+      $('m-cl-delta').textContent = '(TIE)';
+    }
+  }
+  $('m-binance').textContent = fmt(m.binance_price);
+  $('m-time').textContent = m.remaining + ' remaining';
+  $('m-phase').textContent = m.phase;
+  // Price delta
+  if (m.price_delta != null) {
+    var absDelta = Math.abs(m.price_delta);
+    if (m.price_delta > 0) {
+      $('m-delta').innerHTML = '<span class="green">+$' + absDelta.toFixed(2) + '</span>';
+    } else if (m.price_delta < 0) {
+      $('m-delta').innerHTML = '<span class="red">-$' + absDelta.toFixed(2) + '</span>';
+    } else {
+      $('m-delta').textContent = '';
+    }
+  }
+
+  // Strategy
+  var s = d.strategy;
+  $('s-prob').textContent = pct(s.prob_up);
+  $('s-bar').style.width = (s.prob_up * 100) + '%';
+  $('s-edge').textContent = (s.edge >= 0 ? '+' : '') + pct(s.edge);
+  $('s-edge').className = 'value ' + (s.edge >= s.min_edge ? 'green' : '');
+  $('s-dir').textContent = s.direction;
+  $('s-dir').className = 'value ' + (s.direction === 'UP' ? 'green' : s.direction === 'DOWN' ? 'red' : '');
+  $('s-min-edge').textContent = pct(s.min_edge);
+  // Price delta explanation
+  if (m.price_delta != null) {
+    var ad = Math.abs(m.price_delta);
+    var cls = m.price_delta > 0 ? 'green' : 'red';
+    var word = m.price_delta > 0 ? 'above' : 'below';
+    $('s-delta').innerHTML = '<span class="' + cls + '">BTC $' + ad.toFixed(0) + ' ' + word + ' anchor</span>';
+  } else { $('s-delta').textContent = ''; }
+  // Potential outcomes
+  if (s.if_win != null && s.if_win !== 0) {
+    $('s-if-win').textContent = signed(s.if_win);
+    $('s-if-lose').textContent = signed(s.if_lose);
+  } else {
+    $('s-if-win').textContent = '--';
+    $('s-if-lose').textContent = '--';
+  }
+
+  // Risk
+  var r = d.risk;
+  $('r-status').innerHTML = r.halted ? '<span class="red">HALTED: ' + r.halt_reason + '</span>' : '<span class="green">Active</span>';
+  $('r-bankroll').textContent = fmt(r.bankroll);
+  $('r-pnl').textContent = signed(r.daily_pnl) + ' (limit: ' + fmt(r.daily_limit) + ')';
+  $('r-pnl').className = 'value ' + pnlClass(r.daily_pnl);
+  $('r-drawdown').textContent = pct(r.drawdown) + ' (halt: ' + (r.drawdown_halt * 100).toFixed(0) + '%)';
+  $('r-drawdown').className = 'value ' + (r.drawdown > r.drawdown_halt * 0.5 ? 'red' : 'yellow');
+  $('r-exposure').textContent = (r.exposure * 100).toFixed(1) + '% (max: ' + (r.max_exposure * 100).toFixed(0) + '%)';
+
+  // Orders
+  $('ord-count').textContent = d.orders.length;
+  if (d.orders.length === 0) {
+    $('ord-body').innerHTML = '<tr><td class="dim" colspan="4">No orders</td></tr>';
+  } else {
+    $('ord-body').innerHTML = d.orders.map(function(o) {
+      var sc = o.side === 'BUY' ? 'green' : 'red';
+      return '<tr><td class="' + sc + '">' + o.side + '</td><td>' + fmt(o.price) + '</td><td>' + o.size.toFixed(1) + '</td><td>' + o.age + '</td></tr>';
+    }).join('');
+  }
+
+  // Positions
+  $('pos-count').textContent = d.positions.length;
+  if (d.positions.length === 0) {
+    $('pos-body').innerHTML = '<tr><td class="dim" colspan="6">No positions</td></tr>';
+  } else {
+    $('pos-body').innerHTML = d.positions.map(function(p) {
+      var sc = p.side === 'UP' ? 'green' : p.side === 'DOWN' ? 'red' : '';
+      var uc = p.upnl >= 0 ? 'green' : 'red';
+      var wc = p.if_win >= 0 ? 'green' : 'red';
+      return '<tr><td class="' + sc + '">' + p.side + '</td><td>' + p.shares.toFixed(0) + '</td><td>' + fmt(p.cost) + '</td><td>' + fmt(p.value) + '</td><td class="' + uc + '">' + signed(p.upnl) + '</td><td class="' + wc + '">' + signed(p.if_win) + '</td></tr>';
+    }).join('');
+  }
+
+  // Stats
+  $('st-trades').textContent = d.stats.trades;
+  $('st-winrate').textContent = d.stats.win_rate.toFixed(1) + '%';
+  $('st-pnl').textContent = signed(d.stats.session_pnl);
+  $('st-pnl').className = 'value ' + pnlClass(d.stats.session_pnl);
+  $('st-latency').textContent = d.stats.avg_latency_ms.toFixed(0) + 'ms';
+  $('st-peak').textContent = fmt(d.stats.peak_equity);
+
+  // Footer
+  $('last-update').textContent = new Date().toLocaleTimeString();
+}
+
+// SSE connection with auto-reconnect
+function connect() {
+  $('conn-status').textContent = 'Connecting...';
+  $('conn-status').className = 'yellow';
+
+  var es = new EventSource('/api/stream');
+
+  es.onopen = function() {
+    $('conn-status').textContent = 'Connected (live)';
+    $('conn-status').className = 'green';
+  };
+
+  es.onmessage = function(e) {
+    try { update(JSON.parse(e.data)); } catch(err) { console.error('Parse error:', err); }
+  };
+
+  es.onerror = function() {
+    es.close();
+    $('conn-status').textContent = 'Disconnected \u2014 reconnecting in 3s...';
+    $('conn-status').className = 'red';
+    setTimeout(connect, 3000);
+  };
+}
+
+connect();
+</script>
+</body>
+</html>
