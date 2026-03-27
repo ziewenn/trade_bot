@@ -79,14 +79,18 @@ class TestEstimateProbability:
         assert prob >= 0.01
 
     def test_matches_scipy_reference(self):
-        """Verify against manual scipy calculation (within clamping bounds)."""
-        S = 100_005.0  # Small move so result stays within [0.01, 0.99]
+        """Verify against manual scipy calculation (within clamping bounds).
+
+        Uses volatility high enough that sigma > 0.006 floor, so the floor
+        doesn't distort the reference comparison.
+        """
+        S = 100_050.0  # Larger move to produce a meaningful signal
         K = 100_000.0
         t = 200.0
-        vol = 0.00001
+        vol = 0.001  # High enough that sigma = 0.001*sqrt(200) ≈ 0.0141 > floor
 
         log_return = math.log(S / K)
-        sigma = vol * math.sqrt(t)
+        sigma = max(vol * math.sqrt(t), 0.006)  # Apply same floor as production
         z = log_return / sigma
         expected = float(norm.cdf(z))
         # Clamp expected like the function does
@@ -96,10 +100,14 @@ class TestEstimateProbability:
         assert abs(actual - expected) < 0.001
 
     def test_more_time_means_closer_to_50(self):
-        """With more time remaining, probability should be closer to 50%."""
-        # Use a small enough move that clamping doesn't flatten both values
-        prob_short = Strategy.estimate_probability(100_001, 100_000, 30, 0.0001)
-        prob_long = Strategy.estimate_probability(100_001, 100_000, 280, 0.0001)
+        """With more time remaining, probability should be closer to 50%.
+
+        Uses high enough volatility that sigma > 0.002 floor for both cases,
+        so the floor doesn't flatten both to the same value.
+        """
+        # Large price move + high vol so sigma is well above 0.002 floor
+        prob_short = Strategy.estimate_probability(100_500, 100_000, 30, 0.005)
+        prob_long = Strategy.estimate_probability(100_500, 100_000, 280, 0.005)
 
         assert abs(prob_long - 0.5) < abs(prob_short - 0.5)
 
@@ -150,8 +158,12 @@ class TestKellySize:
 class TestSignalGeneration:
     """Test the full signal generation pipeline."""
 
-    def _make_state_with_market(self, anchor=Decimal("100000"), binance=Decimal("100050")):
+    def _make_state_with_market(self, anchor=Decimal("100000"), binance=Decimal("100500"),
+                                chainlink=None):
         import time
+
+        if chainlink is None:
+            chainlink = binance  # Default: Chainlink agrees with Binance
 
         state = SharedState()
         state.current_market = MarketInfo(
@@ -159,13 +171,17 @@ class TestSignalGeneration:
             condition_id="cond123",
             token_id_up="up_token",
             token_id_down="down_token",
-            start_time=time.time() - 10,  # Started 10s ago
-            end_time=time.time() + 290,  # 290s remaining
+            start_time=time.time() - 200,  # Started 200s ago (past min elapsed of 180s)
+            end_time=time.time() + 100,  # 100s remaining
             anchor_price=anchor,
         )
         state.market_phase = MarketPhase.OPEN
         state.binance_price = binance
         state.binance_tick_time = time.monotonic()
+        state.chainlink_price = chainlink
+        state.chainlink_tick_time = time.monotonic()  # Fresh Chainlink
+        state.chainlink_source = "ON-CHAIN"
+        state.anchor_is_authoritative = True
 
         # Set up orderbooks
         state.orderbook_up = OrderBook(
@@ -185,10 +201,14 @@ class TestSignalGeneration:
         return state
 
     def test_signal_with_sufficient_edge(self, settings):
+        """Large gap ($500), late window, Chainlink+Binance agree → should produce signal."""
+        # Override min_edge to 0.02 for easier test triggering
+        settings.min_edge_pct = 0.02
         strategy = Strategy(settings)
         state = self._make_state_with_market(
             anchor=Decimal("100000"),
-            binance=Decimal("100500"),  # Strong upward move
+            binance=Decimal("100500"),  # Strong upward move ($500 > $75 gap)
+            chainlink=Decimal("100500"),  # Chainlink agrees
         )
 
         signal = strategy.generate_signal(state, 1000.0)
@@ -213,5 +233,28 @@ class TestSignalGeneration:
         state = self._make_state_with_market()
         # Set market to have started 300s ago (past 240s entry window)
         state.current_market.start_time = time.time() - 300
+        signal = strategy.generate_signal(state, 1000.0)
+        assert signal is None
+
+    def test_no_signal_too_early_in_window(self, settings):
+        """Should not trade before min elapsed time (180s by default)."""
+        import time
+
+        strategy = Strategy(settings)
+        state = self._make_state_with_market()
+        # Set market to have started only 60s ago (too early)
+        state.current_market.start_time = time.time() - 60
+        state.current_market.end_time = time.time() + 240
+        signal = strategy.generate_signal(state, 1000.0)
+        assert signal is None
+
+    def test_no_signal_small_price_gap(self, settings):
+        """Should not trade when max(binance, chainlink) gap is below minimum ($50)."""
+        strategy = Strategy(settings)
+        state = self._make_state_with_market(
+            anchor=Decimal("100000"),
+            binance=Decimal("100030"),  # Only $30 gap — below $50 min
+            chainlink=Decimal("100020"),  # Also small — max(30, 20) = $30 < $50
+        )
         signal = strategy.generate_signal(state, 1000.0)
         assert signal is None

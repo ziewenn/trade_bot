@@ -120,24 +120,36 @@ class Dashboard:
         mins, secs = divmod(int(remaining), 60)
 
         # Chainlink delta vs anchor (this determines resolution)
-        chainlink_str = f"${float(self.state.chainlink_price):,.2f}" if self.state.chainlink_price > 0 else "--"
-        if market.anchor_price and self.state.chainlink_price > 0:
-            cl_delta = float(self.state.chainlink_price - market.anchor_price)
-            if cl_delta > 0:
-                chainlink_str += f"  [green]+${cl_delta:,.2f} (UP)[/]"
-            elif cl_delta < 0:
-                chainlink_str += f"  [red]-${abs(cl_delta):,.2f} (DOWN)[/]"
-        # Staleness indicator for Chainlink
-        if self.state.chainlink_tick_time > 0:
-            import time as _time
-            cl_age = _time.monotonic() - self.state.chainlink_tick_time
-            if cl_age > 60:
-                chainlink_str += f"  [bold red]STALE ({int(cl_age)}s ago)[/]"
-            elif cl_age > 30:
-                chainlink_str += f"  [yellow]({int(cl_age)}s ago)[/]"
+        import time as _time
+        cl_age = _time.monotonic() - self.state.chainlink_tick_time if self.state.chainlink_tick_time > 0 else float("inf")
+        cl_source = self.state.chainlink_source or "?"
 
-        # Binance delta with color
+        if cl_age > 30:
+            # Emergency: all sources stale
+            chainlink_str = f"[bold red]STALE (>{int(cl_age)}s) — ORDERS CANCELLED[/]"
+        elif cl_age > 10:
+            # Stale: orders should be cancelled
+            chainlink_str = f"${float(self.state.chainlink_price):,.2f}  [bold red]STALE ({cl_age:.1f}s ago)[/]"
+        elif self.state.chainlink_price > 0:
+            chainlink_str = f"${float(self.state.chainlink_price):,.2f}"
+            # Source and age
+            source_color = "green" if cl_source == "RTDS" else "yellow"
+            chainlink_str += f"  [{source_color}]({cl_source}, {cl_age:.1f}s ago)[/]"
+            # Delta vs anchor
+            if market.anchor_price:
+                cl_delta = float(self.state.chainlink_price - market.anchor_price)
+                if cl_delta > 0:
+                    chainlink_str += f"  [green]+${cl_delta:,.2f} (UP)[/]"
+                elif cl_delta < 0:
+                    chainlink_str += f"  [red]-${abs(cl_delta):,.2f} (DOWN)[/]"
+        else:
+            chainlink_str = "[dim]--[/]"
+
+        # Binance delta with color + age
+        binance_age = _time.monotonic() - self.state.binance_tick_time if self.state.binance_tick_time > 0 else float("inf")
         binance_str = f"${float(self.state.binance_price):,.2f}"
+        if self.state.binance_tick_time > 0:
+            binance_str += f"  [dim]({binance_age:.1f}s ago)[/]"
         if market.anchor_price and self.state.binance_price > 0:
             delta = float(self.state.binance_price - market.anchor_price)
             if delta > 0:
@@ -145,9 +157,21 @@ class Dashboard:
             elif delta < 0:
                 binance_str += f"  [red]-${abs(delta):,.2f}[/]"
 
+        # Anchor source and confidence
+        anchor_source = self.state.anchor_source or "none"
+        is_auth = self.state.anchor_is_authoritative
+        if market.anchor_price:
+            anchor_str = f"${float(market.anchor_price):,.2f}"
+            if is_auth:
+                anchor_str += f"  [green]({anchor_source})[/]"
+            else:
+                anchor_str += f"  [yellow]({anchor_source} — trading blocked)[/]"
+        else:
+            anchor_str = "[yellow]Pending...[/]"
+
         rows = [
             f"  Slug:     {market.event_slug}",
-            f"  Anchor:   ${float(market.anchor_price):,.2f}" if market.anchor_price else "  Anchor:   Pending...",
+            f"  Anchor:   {anchor_str}",
             f"  Chainlink:{chainlink_str}",
             f"  Binance:  {binance_str}",
             f"  Time:     {mins}:{secs:02d} remaining",

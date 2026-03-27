@@ -275,7 +275,7 @@ class Bot:
 
     async def _run_chainlink_feed(self):
         async def on_chainlink_price(price, timestamp_ms):
-            self.state.update_chainlink_price(price, timestamp_ms)
+            self.state.update_chainlink_price(price, timestamp_ms, source="RTDS")
             self.state.chainlink_connected = True
 
         async def on_rtds_binance_price(price, timestamp_ms):
@@ -286,8 +286,9 @@ class Bot:
             """Capture anchor price at 5-min boundaries from RTDS batch.
 
             The RTDS `crypto_prices` `btc/usd` batch entry at `ts % 300 == 0`
-            is the EXACT priceToBeat used by Polymarket for resolution.
-            Verified: RTDS value matches Polymarket's priceToBeat to 14 decimal places.
+            is the Chainlink Data Streams price at that boundary — the same
+            feed Polymarket uses for priceToBeat. Background scrape verifies
+            with Gamma API's eventMetadata.priceToBeat when it becomes available.
             """
             for entry in data_array:
                 ts_ms = entry.get("timestamp", 0)
@@ -311,6 +312,19 @@ class Bot:
                 oldest = min(self.state.captured_anchors)
                 del self.state.captured_anchors[oldest]
 
+            # Always track the latest RTDS btc/usd price for pre-boundary snapshot.
+            # This is the Chainlink Data Streams price — same as Polymarket's display.
+            # At boundary crossings, the last value = next cycle's anchor.
+            if data_array:
+                last_entry = data_array[-1]
+                try:
+                    price = Decimal(str(last_entry["value"]))
+                    ts_ms = last_entry.get("timestamp", 0)
+                    if price > 1000:
+                        self.state.update_rtds_btcusd_price(price, ts_ms)
+                except (ValueError, KeyError):
+                    pass
+
         # Background task: on-chain Chainlink refresh + proactive anchor capture
         async def chainlink_onchain_refresher():
             """Periodically fetch on-chain Chainlink price via Polygon RPC.
@@ -331,11 +345,14 @@ class Bot:
                     secs_to_boundary = next_boundary - now_s
 
                     # Near boundary (within 3s): poll every 0.5s for precise capture
+                    # NOTE: On-chain Chainlink is NOT authoritative for anchors
+                    # (only updates on 0.5% deviation). This is a last-resort
+                    # fallback — the pre-boundary RTDS snapshot is preferred.
                     if secs_to_boundary <= 3 or (now_s - current_boundary) <= 2:
                         await asyncio.sleep(0.5)
-                        # Check if we already have this boundary
+                        # Check if we already have this boundary from RTDS sources
                         boundary_ts = current_boundary if (now_s - current_boundary) <= 2 else next_boundary
-                        if boundary_ts not in self.state.captured_anchors:
+                        if boundary_ts not in self.state.captured_anchors and boundary_ts not in self.state.pre_boundary_anchors:
                             result = await self.chainlink_onchain.fetch_latest_price()
                             if result and result.price > 1000:
                                 # Only capture if we're within 2s of the boundary
@@ -345,6 +362,7 @@ class Bot:
                                     self.state.update_chainlink_price(
                                         result.price,
                                         int(result.updated_at * 1000),
+                                        source="ON-CHAIN",
                                     )
                                     logger.info(
                                         "anchor_captured_proactive",
@@ -358,22 +376,106 @@ class Bot:
                                         del self.state.captured_anchors[oldest]
                         continue
 
-                    # Normal: refresh chainlink price every 5s when stale
-                    await asyncio.sleep(5)
-                    chainlink_age = time.monotonic() - self.state.chainlink_tick_time
-                    if self.state.chainlink_price == 0 or chainlink_age > 10:
+                    # Check RTDS Chainlink staleness — poll aggressively when stale
+                    rtds_age = time.monotonic() - self.state.chainlink_rtds_tick_time if self.state.chainlink_rtds_tick_time > 0 else float("inf")
+                    chainlink_age = time.monotonic() - self.state.chainlink_tick_time if self.state.chainlink_tick_time > 0 else float("inf")
+
+                    if self.state.chainlink_price == 0 or rtds_age > 10:
+                        # RTDS stale: poll on-chain every 2s for fast fallback
+                        await asyncio.sleep(2)
                         result = await self.chainlink_onchain.fetch_latest_price()
                         if result and result.price > 1000:
                             self.state.update_chainlink_price(
                                 result.price,
                                 int(result.updated_at * 1000),
+                                source="ON-CHAIN",
                             )
+                    else:
+                        # RTDS healthy: check less frequently
+                        await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    pass
+
+        # Background task: snapshot last RTDS btc/usd price at 5-min boundaries
+        async def rtds_boundary_watcher():
+            """Watch for 5-min boundary crossings and snapshot the last RTDS
+            btc/usd price as the pre-boundary anchor.
+
+            The RTDS `crypto_prices` `btc/usd` feed is the Chainlink Data
+            Streams price. It is an APPROXIMATION of the anchor — close but
+            not exact (can differ by $10-50 from actual priceToBeat). Used
+            as an interim value until the Gamma API confirms the real anchor.
+            """
+            last_boundary = int(time.time()) // 300 * 300
+
+            while True:
+                try:
+                    await asyncio.sleep(0.2)  # Check 5x/sec
+                    now_s = int(time.time())
+                    current_boundary = now_s // 300 * 300
+
+                    if current_boundary > last_boundary:
+                        # Boundary crossed! Snapshot the last RTDS btc/usd price.
+                        price = self.state.rtds_btcusd_last_price
+                        mono = self.state.rtds_btcusd_last_mono
+                        age = time.monotonic() - mono if mono > 0 else float("inf")
+
+                        if price > 1000 and age < 5.0:
+                            # Fresh: received within last 5 seconds
+                            self.state.pre_boundary_anchors[current_boundary] = price
+                            logger.info(
+                                "pre_boundary_anchor_captured",
+                                window_ts=current_boundary,
+                                price=float(price),
+                                age_s=round(age, 2),
+                            )
+                        elif price > 1000 and age < 15.0:
+                            # Stale but usable
+                            self.state.pre_boundary_anchors[current_boundary] = price
+                            logger.warning(
+                                "pre_boundary_anchor_stale",
+                                window_ts=current_boundary,
+                                price=float(price),
+                                age_s=round(age, 2),
+                            )
+                        else:
+                            logger.warning(
+                                "pre_boundary_anchor_missed",
+                                window_ts=current_boundary,
+                                rtds_age_s=round(age, 2) if mono > 0 else "never",
+                            )
+
+                        # Prune old entries
+                        while len(self.state.pre_boundary_anchors) > 20:
+                            oldest = min(self.state.pre_boundary_anchors)
+                            del self.state.pre_boundary_anchors[oldest]
+
+                        # Pre-emptive anchor scrape: start immediately at
+                        # boundary crossing (T+0), before market discovery
+                        # finds the new market. The previous slug's page
+                        # closePrice is available right now.
+                        if self.settings.anchor_scrape_enabled:
+                            new_slug = f"btc-updown-5m-{current_boundary}"
+                            old_slug = f"btc-updown-5m-{current_boundary - 300}"
+                            task = asyncio.create_task(
+                                self._preemptive_anchor_scrape(
+                                    current_boundary, new_slug, old_slug
+                                )
+                            )
+                            self._track_task(
+                                task, f"preemptive_anchor_{current_boundary}"
+                            )
+
+                        last_boundary = current_boundary
                 except asyncio.CancelledError:
                     break
                 except Exception:
                     pass
 
         refresh_task = asyncio.create_task(chainlink_onchain_refresher())
+        boundary_task = asyncio.create_task(rtds_boundary_watcher())
 
         try:
             await self.chainlink_feed.start(
@@ -383,6 +485,93 @@ class Bot:
             )
         finally:
             refresh_task.cancel()
+            boundary_task.cancel()
+
+    async def _preemptive_anchor_scrape(
+        self, boundary_ts: int, new_slug: str, old_slug: str
+    ):
+        """Scrape anchor at boundary crossing, before market discovery.
+
+        Triggered by rtds_boundary_watcher at T+0. Retries up to 5 times
+        with 2s intervals (~10s window) to allow the Polymarket CDN to
+        refresh with the new closePrice/openPrice.
+
+        Stores result in pre_scraped_anchors for on_new_market to pick up.
+        If on_new_market already ran (set a non-authoritative anchor),
+        directly updates the live market state so trading unblocks immediately.
+        """
+        max_attempts = 5
+        retry_interval = 1.0
+
+        for attempt in range(1, max_attempts + 1):
+            if attempt > 1:
+                await asyncio.sleep(retry_interval)
+
+            # If anchor already became authoritative (e.g. on_new_market got
+            # Gamma API priceToBeat, or background scrape succeeded), stop.
+            if self.state.anchor_is_authoritative:
+                logger.debug(
+                    "preemptive_scrape_stopped_already_authoritative",
+                    boundary=boundary_ts,
+                    source=self.state.anchor_source,
+                )
+                return
+
+            try:
+                price, source = await (
+                    self.market_discovery.scrape_authoritative_anchor(
+                        new_slug, old_slug
+                    )
+                )
+                if price is not None:
+                    self.state.pre_scraped_anchors[boundary_ts] = (price, source)
+
+                    # If on_new_market already ran and set a non-authoritative
+                    # anchor, directly upgrade the live market state now.
+                    mkt = self.state.current_market
+                    if (
+                        mkt is not None
+                        and mkt.event_slug == new_slug
+                        and not self.state.anchor_is_authoritative
+                    ):
+                        old_anchor = float(mkt.anchor_price) if mkt.anchor_price else 0
+                        mkt.anchor_price = price
+                        self.state.anchor_source = source
+                        self.state.anchor_is_authoritative = True
+                        self.state.anchor_set_mono = time.monotonic()
+                        logger.info(
+                            "preemptive_anchor_live_upgrade",
+                            boundary=boundary_ts,
+                            slug=new_slug,
+                            price=float(price),
+                            source=source,
+                            attempt=attempt,
+                            interim_delta=round(abs(old_anchor - float(price)), 2),
+                        )
+                    else:
+                        logger.info(
+                            "preemptive_anchor_scraped",
+                            boundary=boundary_ts,
+                            slug=new_slug,
+                            price=float(price),
+                            source=source,
+                            attempt=attempt,
+                        )
+                    return
+            except Exception as e:
+                logger.debug(
+                    "preemptive_anchor_scrape_attempt_failed",
+                    boundary=boundary_ts,
+                    attempt=attempt,
+                    error=str(e),
+                )
+
+        logger.warning(
+            "preemptive_anchor_scrape_exhausted",
+            boundary=boundary_ts,
+            slug=new_slug,
+            attempts=max_attempts,
+        )
 
     async def _resolve_via_api(
         self, old_market: MarketInfo, closing_price
@@ -455,17 +644,24 @@ class Bot:
             )
 
             # Snapshot the closing price NOW and transition immediately.
-            # Don't wait for end_time — that causes a 20-30s freeze.
-            # Resolution accuracy comes from the Polymarket API (background),
-            # not from exact timing of our price capture.
-            # Prefer Chainlink (authoritative), but if stale (>30s old),
-            # use RTDS Binance price (Polymarket's real-time BTC view).
+            # Prefer Chainlink Data Streams (rtds_btcusd) — this is the EXACT
+            # feed Polymarket uses for priceToBeat/resolution. The raw Chainlink
+            # oracle price can be ~$10-20 off from Data Streams.
+            # Fallback chain: Data Streams > raw Chainlink > RTDS Binance > Binance
+            rtds_btcusd_stale = (
+                time.monotonic() - self.state.rtds_btcusd_last_mono > 10
+                if self.state.rtds_btcusd_last_mono > 0
+                else True
+            )
             chainlink_stale = (
                 time.monotonic() - self.state.chainlink_tick_time > 30
                 if self.state.chainlink_tick_time > 0
                 else True
             )
-            if self.state.chainlink_price > 0 and not chainlink_stale:
+            if self.state.rtds_btcusd_last_price > 0 and not rtds_btcusd_stale:
+                closing_price = self.state.rtds_btcusd_last_price
+                closing_source = "chainlink_data_streams"
+            elif self.state.chainlink_price > 0 and not chainlink_stale:
                 closing_price = self.state.chainlink_price
                 closing_source = "chainlink"
             elif self.state.rtds_binance_price > 0:
@@ -495,43 +691,83 @@ class Bot:
             self.state.current_market = market
             self.state.market_phase = MarketPhase.OPEN
 
-            # Set anchor price FAST — don't block on slow sources.
-            # Use instant sources as INTERIM anchor, then scrape page for
-            # the AUTHORITATIVE priceToBeat in background.
+            # Set anchor price for new cycle.
+            # Key insight: priceToBeat[N] = finalPrice[N-1] = closing price
+            # of the previous cycle. We already captured closing_price above
+            # at the exact transition moment, so use it directly.
+            # Background scrape will verify with Gamma API priceToBeat.
             window_ts = int(market.start_time) - (int(market.start_time) % 300)
             anchor = None
             source = None
+            is_authoritative = False
 
-            # 1) RTDS batch capture at boundary (already in memory, instant)
-            captured = self.state.get_captured_anchor(window_ts)
-            if captured is not None:
-                anchor = captured
-                source = "rtds_batch"
+            # 0) Gamma API priceToBeat (from _parse_event) — exact anchor
+            # Populated if the Gamma API returned eventMetadata.priceToBeat
+            # when the market was discovered (usually only after ~60s).
+            if market.anchor_price is not None and market.anchor_price > 1000:
+                anchor = market.anchor_price
+                source = "gamma_api_priceToBeat"
+                is_authoritative = True
 
-            # 2) On-chain Chainlink (fast RPC call, <1s)
+            # 1) Closing price of previous cycle — interim estimate only.
+            # Can be ~$30+ off from Polymarket's actual priceToBeat.
+            # NOT authoritative: trading stays blocked until scrape succeeds.
+            if anchor is None and closing_price is not None and closing_price > 1000:
+                anchor = closing_price
+                source = f"prev_closing_{closing_source}"
+                is_authoritative = False
+
+            # 2) Pre-scraped anchor from boundary watcher (launched at T+0)
+            if anchor is None:
+                pre_scraped = self.state.pre_scraped_anchors.get(window_ts)
+                if pre_scraped is not None:
+                    anchor, source = pre_scraped
+                    is_authoritative = True
+
+            # 3) RTDS batch exact match (ts % 300 == 0)
+            if anchor is None:
+                captured = self.state.get_captured_anchor(window_ts)
+                if captured is not None:
+                    anchor = captured
+                    source = "rtds_batch"
+                    is_authoritative = True
+
+            # 4) Pre-boundary snapshot (last RTDS btc/usd before crossing)
+            if anchor is None:
+                pre_boundary = self.state.pre_boundary_anchors.get(window_ts)
+                if pre_boundary is not None:
+                    anchor = pre_boundary
+                    source = "rtds_pre_boundary"
+                    is_authoritative = True
+
+            # 5) On-chain Chainlink — slightly stale but usable
             if anchor is None:
                 onchain = await self.chainlink_onchain.fetch_latest_price()
                 if onchain and onchain.age_seconds < 30:
                     anchor = onchain.price
                     source = "chainlink_onchain"
+                    is_authoritative = False
 
-            # 3) Current Chainlink price from state (instant)
+            # 6) Current Chainlink state — last resort
             if anchor is None and self.state.chainlink_price > 1000:
                 anchor = self.state.chainlink_price
                 source = "chainlink_state"
+                is_authoritative = False
 
-            # 4) Current Binance price (last resort, instant)
-            if anchor is None and self.state.binance_price > 0:
-                anchor = self.state.binance_price
-                source = "binance_current"
+            # NOTE: Binance intentionally NOT used as anchor source.
+            # It's a different price feed and can diverge from Chainlink.
 
             if anchor is not None:
                 market.anchor_price = anchor
                 self.state.anchor_source = source
-                self.state.anchor_is_authoritative = False  # Interim until scrape confirms
-                logger.info(
-                    "anchor_interim_set",
+                self.state.anchor_is_authoritative = is_authoritative
+                if is_authoritative:
+                    self.state.anchor_set_mono = time.monotonic()
+                log_fn = logger.info if is_authoritative else logger.warning
+                log_fn(
+                    "anchor_set",
                     source=source,
+                    authoritative=is_authoritative,
                     anchor=float(anchor),
                     market=market.event_slug,
                 )
@@ -543,13 +779,23 @@ class Bot:
                     market=market.event_slug,
                 )
 
-            # Background: scrape Polymarket event page for authoritative priceToBeat.
-            # This is the ONLY reliable source for the exact anchor price.
-            # Strategy: priceToBeat[N] = finalPrice[N-1].
-            # Phase 1: fast retries every 3s for ~30s (page may update quickly)
-            # Phase 2: slower retries every 15s for ~150s (covers delayed updates)
+            # Background: fetch exact priceToBeat from page scrape / Gamma API.
+            # Corrects the interim anchor (rtds_batch/pre_boundary) if the
+            # actual priceToBeat differs. Trading is NOT blocked while waiting.
+            # CDN/Gamma API typically refresh ~60-75s after cycle transition.
             async def _scrape_authoritative_anchor(mkt, slug, prev_slug):
                 """Scrape priceToBeat as the authoritative anchor source."""
+                window_ts = int(mkt.start_time) - (int(mkt.start_time) % 300)
+
+                # Check if preemptive scrape or another source already set authoritative
+                if self.state.anchor_is_authoritative:
+                    logger.debug(
+                        "scrape_skipped_already_authoritative",
+                        slug=slug,
+                        source=self.state.anchor_source,
+                    )
+                    return
+
                 phases = [
                     (self.settings.anchor_scrape_phase1_attempts,
                      self.settings.anchor_scrape_phase1_interval_s),
@@ -561,10 +807,22 @@ class Bot:
                 for count, interval in phases:
                     for _ in range(count):
                         attempt_num += 1
-                        await asyncio.sleep(interval)
+                        # First attempt immediate, then sleep between retries
+                        if attempt_num > 1:
+                            await asyncio.sleep(interval)
 
                         # Check if market changed (don't update stale market)
                         if self.state.current_market != mkt:
+                            return
+
+                        # Check if preemptive scrape upgraded anchor while we slept
+                        if self.state.anchor_is_authoritative:
+                            logger.debug(
+                                "scrape_stopped_authoritative_during_retry",
+                                slug=slug,
+                                source=self.state.anchor_source,
+                                attempt=attempt_num,
+                            )
                             return
 
                         try:
@@ -579,6 +837,7 @@ class Bot:
                                 mkt.anchor_price = price
                                 self.state.anchor_source = scrape_source
                                 self.state.anchor_is_authoritative = True
+                                self.state.anchor_set_mono = time.monotonic()
                                 logger.info(
                                     "anchor_authoritative_set",
                                     source=scrape_source,
@@ -597,6 +856,7 @@ class Bot:
 
                 # All retries exhausted — promote interim anchor
                 self.state.anchor_is_authoritative = True
+                self.state.anchor_set_mono = time.monotonic()
                 logger.warning(
                     "anchor_scrape_exhausted",
                     slug=slug,
@@ -616,6 +876,7 @@ class Bot:
             else:
                 # Scraping disabled — treat interim as authoritative
                 self.state.anchor_is_authoritative = True
+                self.state.anchor_set_mono = time.monotonic()
 
             # --- RESOLVE OLD MARKET VIA API (background) ---
             # Poll Polymarket API for authoritative outcome, then resolve positions.
@@ -671,6 +932,13 @@ class Bot:
                 first_market = False
 
             await on_new_market(market)
+
+        # Launch persistent Playwright browser for instant anchor scraping.
+        # The page stays open and auto-updates via Polymarket's client-side JS.
+        now_s = int(time.time())
+        current_boundary = now_s - (now_s % 300)
+        initial_slug = f"btc-updown-5m-{current_boundary}"
+        await self.market_discovery.start_persistent_browser(initial_slug)
 
         await self.market_discovery.start(on_market_with_ws_init)
 

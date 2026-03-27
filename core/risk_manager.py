@@ -85,6 +85,8 @@ class RiskManager:
 
         was_stale_binance = False
         was_stale_poly = False
+        was_stale_chainlink = False
+        was_emergency_chainlink = False
 
         while True:
             try:
@@ -119,6 +121,43 @@ class RiskManager:
                     if was_stale_poly:
                         logger.info("polymarket_data_resumed")
                     was_stale_poly = False
+
+                # Chainlink stale check (any source — RTDS or on-chain)
+                chainlink_age = now - self.state.chainlink_tick_time if self.state.chainlink_tick_time > 0 else 0
+                if self.state.chainlink_tick_time > 0 and chainlink_age > self.settings.stale_chainlink_threshold_s:
+                    if not was_stale_chainlink:
+                        logger.warning(
+                            "stale_chainlink_data",
+                            seconds_since_last=round(chainlink_age, 1),
+                            source=self.state.chainlink_source,
+                        )
+                        await cancel_callback()
+                        was_stale_chainlink = True
+
+                    # Emergency: BOTH sources stale > 30s → full halt
+                    if chainlink_age > self.settings.chainlink_emergency_stale_s:
+                        if not was_emergency_chainlink:
+                            logger.error(
+                                "chainlink_emergency_stale",
+                                seconds_since_last=round(chainlink_age, 1),
+                            )
+                            await self._trigger_halt("chainlink_all_stale")
+                            was_emergency_chainlink = True
+                else:
+                    if was_stale_chainlink:
+                        logger.info(
+                            "chainlink_data_resumed",
+                            source=self.state.chainlink_source,
+                        )
+                    was_stale_chainlink = False
+
+                    # Auto-resume from Chainlink emergency halt
+                    if was_emergency_chainlink:
+                        if self.risk_state.is_halted and self.risk_state.halt_reason == "chainlink_all_stale":
+                            self.risk_state.is_halted = False
+                            self.risk_state.halt_reason = None
+                            logger.info("chainlink_emergency_halt_cleared")
+                        was_emergency_chainlink = False
 
                 # Update risk state timestamps
                 self.risk_state.last_binance_tick = self.state.binance_tick_time

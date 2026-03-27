@@ -37,11 +37,16 @@ class Settings(BaseSettings):
     order_offset_cents: float = 0.01
     cancel_replace_interval_ms: int = 500
     market_entry_window_sec: int = 240  # Trade within first 4 min of 5-min window
+    market_entry_min_elapsed_sec: int = 180  # Don't enter before 3 min elapsed
     market_exit_buffer_sec: int = 30
+    min_price_gap_usd: float = 50.0  # Min price gap (max of binance/chainlink) to trade
+    binance_prediction_weight: float = 0.4  # Blend weight: 0=Chainlink only, 1=Binance only
 
     # Stale data thresholds
     stale_binance_threshold_s: float = 5.0
     stale_polymarket_threshold_s: float = 10.0
+    stale_chainlink_threshold_s: float = 10.0  # Cancel orders if Chainlink stale > 10s
+    chainlink_emergency_stale_s: float = 30.0  # Halt trading if ALL Chainlink sources stale > 30s
 
     # Volatility — lower = more sensitive to price moves = more trades
     volatility_per_second: float = 0.0005
@@ -50,9 +55,9 @@ class Settings(BaseSettings):
     anchor_scrape_enabled: bool = True
     anchor_scrape_timeout_s: float = 8.0
     anchor_scrape_playwright_fallback: bool = False
-    anchor_scrape_phase1_interval_s: float = 3.0   # fast retries for first 30s
-    anchor_scrape_phase2_interval_s: float = 15.0   # slower retries after 30s
-    anchor_scrape_phase1_attempts: int = 10          # ~30s of fast retries
+    anchor_scrape_phase1_interval_s: float = 1.5   # fast retries between attempts
+    anchor_scrape_phase2_interval_s: float = 15.0   # slower retries after phase 1
+    anchor_scrape_phase1_attempts: int = 10          # ~15s of fast retries
     anchor_scrape_phase2_attempts: int = 10          # ~150s of slow retries
 
     # WebSocket URLs (overridable)

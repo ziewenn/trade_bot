@@ -27,6 +27,11 @@ class SharedState:
     chainlink_price: Decimal = Decimal("0")
     chainlink_tick_time: float = 0.0
     chainlink_connected: bool = False
+    chainlink_source: str = ""  # "RTDS" or "ON-CHAIN" — which source last updated chainlink_price
+
+    # On-chain Chainlink (separate tracking for fallback monitoring)
+    chainlink_rtds_tick_time: float = 0.0  # last RTDS Chainlink update
+    chainlink_onchain_tick_time: float = 0.0  # last on-chain Chainlink update
 
     # RTDS Binance price (frequent — updates every few seconds)
     # This is Polymarket's view of BTC price, used as proxy when
@@ -55,14 +60,31 @@ class SharedState:
     session_pnl: Decimal = Decimal("0")
     paper_bankroll: Decimal = Decimal("0")  # Synced from PaperTrader
 
+    # RTDS btc/usd (Chainlink Data Streams) continuous tracking
+    # This is close to Polymarket's display price but NOT exact for anchoring.
+    # Used as interim approximation; authoritative anchor comes from Gamma API.
+    rtds_btcusd_last_price: Decimal = Decimal("0")
+    rtds_btcusd_last_ts_ms: int = 0
+    rtds_btcusd_last_mono: float = 0.0  # time.monotonic() when received
+
     # Captured anchor prices at 5-minute boundaries
     # Maps window_start_ts (int) -> Chainlink BTC/USD price (Decimal)
     # Populated by the Chainlink callback on each boundary crossing
     captured_anchors: dict[int, Decimal] = field(default_factory=dict)
 
+    # Pre-boundary anchor snapshots (last RTDS btc/usd before each boundary)
+    # Maps window_start_ts (int) -> last Data Streams price before crossing
+    pre_boundary_anchors: dict[int, Decimal] = field(default_factory=dict)
+
+    # Pre-scraped authoritative anchors (from boundary watcher at T+0)
+    # Maps window_start_ts (int) -> (price, source_label)
+    # Populated by _preemptive_anchor_scrape, consumed by on_new_market
+    pre_scraped_anchors: dict[int, tuple] = field(default_factory=dict)
+
     # Anchor confidence tracking
-    anchor_source: str = ""                  # e.g. "rtds_batch", "scraped_priceToBeat"
-    anchor_is_authoritative: bool = False    # True only after page scrape confirms
+    anchor_source: str = ""                  # e.g. "rtds_batch", "rtds_pre_boundary", "scraped_priceToBeat"
+    anchor_is_authoritative: bool = False    # True for rtds_batch, pre_boundary, scraped, gamma_api sources
+    anchor_set_mono: float = 0.0            # time.monotonic() when authoritative anchor was set
 
     # Strategy state
     current_true_prob: float = 0.5
@@ -79,9 +101,25 @@ class SharedState:
             (ts, p) for ts, p in self.price_history if ts >= cutoff
         ]
 
-    def update_chainlink_price(self, price: Decimal, timestamp_ms: int):
+    def update_chainlink_price(self, price: Decimal, timestamp_ms: int, source: str = ""):
         self.chainlink_price = price
         self.chainlink_tick_time = time.monotonic()
+        if source:
+            self.chainlink_source = source
+        if source == "RTDS":
+            self.chainlink_rtds_tick_time = time.monotonic()
+        elif source == "ON-CHAIN":
+            self.chainlink_onchain_tick_time = time.monotonic()
+
+    def update_rtds_btcusd_price(self, price: Decimal, timestamp_ms: int):
+        """Track the latest RTDS btc/usd (Chainlink Data Streams) price.
+
+        Continuously overwritten. At boundary crossings, the last value
+        becomes the pre-boundary anchor snapshot (approximate, not exact).
+        """
+        self.rtds_btcusd_last_price = price
+        self.rtds_btcusd_last_ts_ms = timestamp_ms
+        self.rtds_btcusd_last_mono = time.monotonic()
 
     def update_rtds_binance_price(self, price: Decimal, timestamp_ms: int):
         self.rtds_binance_price = price

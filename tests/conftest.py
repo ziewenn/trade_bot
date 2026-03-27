@@ -24,9 +24,12 @@ def settings():
         kelly_fraction=0.25,
         min_edge_pct=0.02,
         max_concurrent_exposure_pct=0.15,
-        volatility_per_second=0.00005,
+        volatility_per_second=0.0005,
         market_entry_window_sec=240,
+        market_entry_min_elapsed_sec=180,
         market_exit_buffer_sec=30,
+        min_price_gap_usd=50.0,
+        binance_prediction_weight=0.4,
         order_offset_cents=0.01,
         cancel_replace_interval_ms=500,
     )

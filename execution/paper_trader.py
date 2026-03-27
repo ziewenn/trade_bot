@@ -29,8 +29,10 @@ class PaperTrader(TraderInterface):
         self._orders: dict[str, Order] = {}  # order_id -> Order
         self._positions: dict[str, Position] = {}  # token_id -> Position
         self._realized_pnl = Decimal("0")
-        self._total_fills: int = 0
-        self._winning_fills: int = 0
+        self._total_fills: int = 0        # All fills (entries + exits) for logging
+        self._winning_fills: int = 0      # Legacy — kept for compat
+        self._total_trades: int = 0       # Counted only at position CLOSE
+        self._winning_trades: int = 0     # Counted only when close PnL > 0
 
     def set_shared_state(self, state: "SharedState"):
         """Connect to SharedState for real-time dashboard sync."""
@@ -44,8 +46,8 @@ class PaperTrader(TraderInterface):
         self._shared_state.open_positions = self._positions.copy()
         self._shared_state.paper_bankroll = self.bankroll
         self._shared_state.session_pnl = self._realized_pnl
-        self._shared_state.total_trades = self._total_fills
-        self._shared_state.winning_trades = self._winning_fills
+        self._shared_state.total_trades = self._total_trades
+        self._shared_state.winning_trades = self._winning_trades
 
     async def place_order(
         self,
@@ -290,11 +292,13 @@ class PaperTrader(TraderInterface):
                 pnl = (fill_price - existing.avg_entry_price) * close_size
                 self._realized_pnl += pnl
                 self.bankroll += fill_price * close_size
-                if pnl > 0:
-                    self._winning_fills += 1
 
                 existing.size -= close_size
                 if existing.size <= 0:
+                    # Position fully closed — count as one completed trade
+                    self._total_trades += 1
+                    if pnl > 0:
+                        self._winning_trades += 1
                     del self._positions[token_id]
 
                     # Record position close in DB
@@ -333,9 +337,8 @@ class PaperTrader(TraderInterface):
             )
             del self._positions[winning_token_id]
 
-            self._total_fills += 1
-            if pnl > 0:
-                self._winning_fills += 1
+            self._total_trades += 1
+            self._winning_trades += 1
 
             logger.info(
                 "paper_resolution_win",
@@ -358,7 +361,7 @@ class PaperTrader(TraderInterface):
             )
             del self._positions[losing_token_id]
 
-            self._total_fills += 1
+            self._total_trades += 1
 
             logger.info(
                 "paper_resolution_loss",

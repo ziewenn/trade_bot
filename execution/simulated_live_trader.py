@@ -145,25 +145,85 @@ class SimulatedLiveTrader(PaperTrader):
             )
             return
 
-        # Apply higher slippage than paper trading
+        # Apply sim-live slippage (1.5¢ default) WITHOUT delegating to parent,
+        # which would add another 0.5¢ on top. We handle the full fill here.
         order = self._orders.get(order_id)
         if not order or order.status != OrderStatus.LIVE:
             return
 
         if order.side == Side.BUY:
-            # Worse price for buyer (pay more)
-            adjusted_price = trade_price + self._slippage
+            fill_price = min(order.price, trade_price + self._slippage)
         else:
-            # Worse price for seller (receive less)
-            adjusted_price = trade_price - self._slippage
+            fill_price = max(order.price, trade_price - self._slippage)
 
-        # Delegate to parent with adjusted price
-        await super()._simulate_fill(
-            order_id=order_id,
-            trade_price=adjusted_price,
-            available_size=available_size,
-            timestamp_ms=timestamp_ms,
+        # Determine fill size
+        remaining = order.size - order.filled_size
+        fill_size = min(remaining, available_size)
+
+        if fill_size <= 0:
+            return
+
+        # Update order state
+        order.filled_size += fill_size
+        order.avg_fill_price = (
+            (order.avg_fill_price * (order.filled_size - fill_size) + fill_price * fill_size)
+            / order.filled_size
         )
+
+        if order.filled_size >= order.size:
+            order.status = OrderStatus.FILLED
+            del self._orders[order_id]
+        else:
+            order.status = OrderStatus.PARTIALLY_FILLED
+
+        # Update position
+        await self._update_position(order, fill_price, fill_size, timestamp_ms)
+
+        # Record trade (maker fee = 0)
+        from data.models import Trade
+        trade = Trade(
+            trade_id=Trade.generate_id(),
+            order_id=order.order_id,
+            token_id=order.token_id,
+            side=order.side,
+            price=fill_price,
+            size=fill_size,
+            fee=Decimal("0"),
+            pnl=Decimal("0"),
+            timestamp=timestamp_ms / 1000.0,
+            is_paper=self.is_paper,
+            market_condition_id=order.market_condition_id,
+        )
+
+        await self.db.insert_trade(
+            trade_id=trade.trade_id,
+            order_id=trade.order_id,
+            market_condition_id=trade.market_condition_id,
+            token_id=trade.token_id,
+            side=trade.side.value,
+            outcome="",
+            price=trade.price,
+            size=trade.size,
+            fee=trade.fee,
+            realized_pnl=trade.pnl,
+            is_paper=trade.is_paper,
+            timestamp=trade.timestamp,
+        )
+
+        self._total_fills += 1
+
+        logger.info(
+            "sim_fill",
+            order_id=order.order_id[:8],
+            side=order.side.value,
+            fill_price=float(fill_price),
+            fill_size=float(fill_size),
+            slippage_cents=float(self._slippage),
+            status=order.status.value,
+            bankroll=float(self.bankroll),
+        )
+
+        self._sync_to_state()
 
     @property
     def avg_order_latency_ms(self) -> float:

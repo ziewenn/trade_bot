@@ -31,6 +31,9 @@ class Strategy:
         self.exit_buffer_sec = settings.market_exit_buffer_sec
         self.order_offset = Decimal(str(settings.order_offset_cents))
         self.volatility_per_second = settings.volatility_per_second
+        self._entry_min_elapsed_sec = settings.market_entry_min_elapsed_sec
+        self._min_price_gap = settings.min_price_gap_usd
+        self._binance_weight = settings.binance_prediction_weight
 
         # Volatility calibration state
         self._vol_window: list[tuple[int, float]] = []  # (ts_ms, log_return)
@@ -49,6 +52,29 @@ class Strategy:
             logger.info("signal_skip", reason="no_market_or_anchor")
             return None
 
+        # Block trading if anchor is not authoritative (on-chain/state sources
+        # can be $10+ wrong, causing guaranteed wrong-direction bets)
+        if not state.anchor_is_authoritative:
+            logger.info(
+                "signal_skip",
+                reason="anchor_not_authoritative",
+                source=state.anchor_source,
+            )
+            return None
+
+        # Cooldown: wait 2 seconds after anchor is set for price feeds to stabilize.
+        # Right after cycle transition, Chainlink/Binance prices may be stale or
+        # jumpy, causing wrong-direction bets.
+        import time
+        anchor_age = time.monotonic() - state.anchor_set_mono
+        if state.anchor_set_mono > 0 and anchor_age < 2.0:
+            logger.info(
+                "signal_skip",
+                reason="anchor_cooldown",
+                age_s=round(anchor_age, 2),
+            )
+            return None
+
         # Check market phase
         remaining = state.get_remaining_seconds()
         elapsed = state.get_elapsed_seconds()
@@ -60,9 +86,28 @@ class Strategy:
         if elapsed > self.entry_window_sec:
             return None
 
+        # Don't enter too early — probability estimates are unreliable with
+        # lots of remaining time because small gaps easily revert
+        if elapsed < self._entry_min_elapsed_sec:
+            logger.info("signal_skip", reason="too_early", elapsed=round(elapsed, 1))
+            return None
+
         # Don't enter if too close to resolution
         if remaining <= self.exit_buffer_sec:
             return None
+
+        # Don't trade if Chainlink is stale — Polymarket resolves using Chainlink,
+        # so trading without fresh Chainlink data risks guaranteed losses
+        if state.chainlink_tick_time > 0:
+            chainlink_age = time.monotonic() - state.chainlink_tick_time
+            if chainlink_age > 10:
+                logger.info(
+                    "signal_skip",
+                    reason="chainlink_stale",
+                    seconds_since_last=round(chainlink_age, 1),
+                    source=state.chainlink_source,
+                )
+                return None
 
         # Need both Binance price and orderbook data
         if state.binance_price <= 0:
@@ -70,14 +115,69 @@ class Strategy:
             return None
 
         anchor = float(market.anchor_price)
-        current = float(state.binance_price)
+        current = float(state.chainlink_price)  # Chainlink = resolution oracle
+        binance = float(state.binance_price)     # Binance = leading indicator
 
         if anchor <= 0 or current <= 0:
             return None
 
-        # Estimate true probability
+        # Require minimum price gaps to filter noise.
+        # Binance gap: uses max(binance, chainlink) since Binance leads.
+        # Chainlink gap: MUST also have a meaningful gap since Chainlink
+        # resolves the market. A tiny Chainlink gap ($3) can easily flip
+        # even if Binance is far away — Chainlink hasn't confirmed the move yet.
+        chainlink_gap = abs(current - anchor)
+        binance_gap = abs(binance - anchor)
+        price_gap = max(chainlink_gap, binance_gap)
+        if price_gap < self._min_price_gap:
+            logger.info(
+                "signal_skip",
+                reason="price_gap_too_small",
+                gap_usd=round(price_gap, 2),
+                chainlink_gap=round(chainlink_gap, 2),
+                binance_gap=round(binance_gap, 2),
+                min_required=self._min_price_gap,
+            )
+            return None
+
+        # Chainlink must have moved at least 25% of the min gap threshold.
+        # If Chainlink is only $3 from anchor while Binance is $200 away,
+        # Chainlink hasn't confirmed the move and could easily flip direction.
+        min_chainlink_gap = self._min_price_gap * 0.25
+        if chainlink_gap < min_chainlink_gap:
+            logger.info(
+                "signal_skip",
+                reason="chainlink_gap_too_small",
+                chainlink_gap=round(chainlink_gap, 2),
+                binance_gap=round(binance_gap, 2),
+                min_chainlink_gap=round(min_chainlink_gap, 2),
+            )
+            return None
+
+        # Only trade when Binance CONFIRMS Chainlink direction.
+        # Both must agree on which side of the anchor BTC is on.
+        chainlink_says_up = current > anchor
+        binance_says_up = binance > anchor
+        if chainlink_says_up != binance_says_up:
+            logger.info(
+                "signal_skip",
+                reason="binance_chainlink_disagree",
+                chainlink=round(current, 2),
+                binance=round(binance, 2),
+                anchor=round(anchor, 2),
+            )
+            return None
+
+        # Blend Chainlink (confirmed) with Binance (leading indicator) to
+        # predict where Chainlink will be at resolution. Binance moves first,
+        # Chainlink follows — so incorporating Binance gives us a forward-looking
+        # estimate. Works for both UP and DOWN directions symmetrically.
+        w = self._binance_weight
+        predicted_price = (1 - w) * current + w * binance
+
+        # Estimate true probability using the blended predicted price
         true_prob_up = self.estimate_probability(
-            current_price=current,
+            current_price=predicted_price,
             anchor_price=anchor,
             remaining_seconds=remaining,
             volatility_per_second=self._calibrated_vol,
@@ -96,29 +196,36 @@ class Strategy:
             )
             return None
 
-        # Calculate edge for both directions
-        edge_up = true_prob_up - market_prob_up
-        edge_down = (1.0 - true_prob_up) - (1.0 - market_prob_up)
-        # edge_down = -edge_up, but clearer this way
-
-        # Determine direction and check minimum edge
-        if abs(edge_up) < self.min_edge:
-            return None
-
-        if edge_up > 0:
-            # Up is underpriced — buy Up token
+        # Only trade IN the direction Chainlink indicates — never against it.
+        # If Chainlink is above anchor, only buy UP. If below, only buy DOWN.
+        # Betting against the resolution oracle's current direction is a losing strategy.
+        if chainlink_says_up:
             direction = "UP"
-            edge = edge_up
+            edge = true_prob_up - market_prob_up
             token_id = market.token_id_up
             best_bid = state.best_bid_up
             market_price = market_prob_up
         else:
-            # Down is underpriced — buy Down token
             direction = "DOWN"
-            edge = abs(edge_down)
+            true_prob_down = 1.0 - true_prob_up
+            market_prob_down = 1.0 - market_prob_up
+            edge = true_prob_down - market_prob_down
             token_id = market.token_id_down
             best_bid = state.best_bid_down
-            market_price = 1.0 - market_prob_up
+            market_price = market_prob_down
+
+        # Check minimum edge — only trade if we think our side is underpriced
+        if edge < self.min_edge:
+            logger.info(
+                "signal_skip",
+                reason="insufficient_edge",
+                direction=direction,
+                edge=round(edge, 4),
+                min_required=self.min_edge,
+                true_prob=round(true_prob_up, 4),
+                market_prob=round(market_prob_up, 4),
+            )
+            return None
 
         if best_bid is None:
             return None
@@ -162,6 +269,9 @@ class Strategy:
             edge=round(edge, 4),
             size=float(size),
             price=float(order_price),
+            predicted_price=round(predicted_price, 2),
+            chainlink=round(current, 2),
+            binance=round(binance, 2),
         )
 
         return Signal(
@@ -243,6 +353,12 @@ class Strategy:
 
         # Standard deviation of remaining price movement
         sigma = volatility_per_second * math.sqrt(remaining_seconds)
+
+        # Floor: never let sigma drop below 0.6% — prevents overconfident
+        # probability estimates from small price moves in quiet markets.
+        # BTC's typical 5-minute realized vol is 0.15-0.30%; floor at 0.6%
+        # ensures the model can never be more than ~57% confident on noise.
+        sigma = max(sigma, 0.006)
 
         if sigma == 0:
             return 1.0 if current_price >= anchor_price else 0.0
@@ -328,6 +444,10 @@ class Strategy:
                     avg_dt_ms = (timestamps[-1] - timestamps[0]) / (len(timestamps) - 1)
                     avg_dt_s = avg_dt_ms / 1000.0
                     if avg_dt_s > 0:
-                        self._calibrated_vol = realized_std / math.sqrt(avg_dt_s)
+                        # Floor: prevent overconfident estimates in quiet markets
+                        self._calibrated_vol = max(
+                            realized_std / math.sqrt(avg_dt_s),
+                            0.0002,  # Never below 0.02%/sec
+                        )
 
         self._last_vol_price = price
