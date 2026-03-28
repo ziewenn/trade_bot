@@ -140,7 +140,15 @@ class Database:
                 str(size), str(avg_entry_price), is_paper, opened_at,
             ),
         )
-        await self._db.commit()
+
+    async def update_position_size(
+        self, token_id: str, size: Decimal, avg_entry_price: Decimal
+    ):
+        await self._db.execute(
+            """UPDATE positions SET size=?, avg_entry_price=?
+               WHERE token_id=? AND closed_at IS NULL""",
+            (str(size), str(avg_entry_price), token_id),
+        )
 
     async def close_position(
         self, token_id: str, close_price: Decimal, pnl: Decimal, closed_at: float

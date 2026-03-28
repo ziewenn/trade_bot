@@ -956,6 +956,24 @@ class Bot:
                 await self.db.flush()
                 flush_count += 1
 
+                # Save daily stats every flush
+                from datetime import datetime, timezone
+                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                equity = float(self.state.paper_bankroll) + sum(
+                    float(p.avg_entry_price * p.size)
+                    for p in self.state.open_positions.values()
+                )
+                await self.db.upsert_daily_stats(
+                    date_str=today,
+                    total_trades=self.state.total_trades,
+                    winning_trades=self.state.winning_trades,
+                    total_pnl=self.state.session_pnl,
+                    max_drawdown=Decimal(str(round(self.risk_manager.drawdown_from_peak, 6))),
+                    peak_equity=Decimal(str(round(self.risk_manager.risk_state.peak_equity, 2))),
+                    closing_equity=Decimal(str(round(equity, 2))),
+                    is_paper=self.settings.trading_mode != "live",
+                )
+
                 # Purge price ticks older than 24 hours every 10 flushes (~5 min)
                 if flush_count % 10 == 0:
                     cutoff_ms = int((time.time() - 86400) * 1000)

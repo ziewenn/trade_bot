@@ -289,15 +289,16 @@ class PaperTrader(TraderInterface):
 
         if order.side == Side.BUY:
             if existing:
-                # Add to existing position
                 total_size = existing.size + fill_size
                 existing.avg_entry_price = (
                     (existing.avg_entry_price * existing.size + fill_price * fill_size)
                     / total_size
                 )
                 existing.size = total_size
+                await self.db.update_position_size(
+                    token_id, existing.size, existing.avg_entry_price,
+                )
             else:
-                # New position
                 pos = Position(
                     token_id=token_id,
                     outcome="",
@@ -307,7 +308,16 @@ class PaperTrader(TraderInterface):
                 )
                 self._positions[token_id] = pos
 
-            # Deduct cost from bankroll
+                await self.db.insert_position(
+                    token_id=token_id,
+                    market_condition_id=order.market_condition_id,
+                    outcome="",
+                    size=fill_size,
+                    avg_entry_price=fill_price,
+                    is_paper=self.is_paper,
+                    opened_at=timestamp_ms / 1000.0,
+                )
+
             self.bankroll -= fill_price * fill_size
 
         elif order.side == Side.SELL:
