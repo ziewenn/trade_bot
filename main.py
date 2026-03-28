@@ -103,6 +103,7 @@ class Bot:
 
         # 4. Initialize shared state
         self.state = SharedState()
+        self.state.starting_bankroll = self.settings.initial_bankroll
 
         # 5. Initialize feeds
         self.binance_feed = BinanceFeed(
@@ -627,7 +628,10 @@ class Bot:
                 market=old_market.event_slug,
             )
 
-            await self.trader.resolve_market(winning_token, losing_token)
+            await self.trader.resolve_market(
+                winning_token, losing_token,
+                outcome="UP" if btc_went_up else "DOWN",
+            )
 
         except Exception as e:
             logger.error(

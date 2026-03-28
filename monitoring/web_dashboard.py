@@ -118,8 +118,13 @@ class WebDashboard:
         remaining = s.get_remaining_seconds()
         r_mins, r_secs = divmod(int(remaining), 60)
 
-        # Bankroll
-        bankroll = float(s.paper_bankroll) if s.paper_bankroll > 0 else rs.bankroll
+        # Equity = cash + position cost
+        cash = float(s.paper_bankroll) if s.paper_bankroll > 0 else rs.bankroll
+        position_cost = sum(
+            float(p.avg_entry_price * p.size)
+            for p in s.open_positions.values()
+        )
+        bankroll = cash + position_cost
 
         # Stats
         total = s.total_trades

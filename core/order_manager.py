@@ -100,11 +100,12 @@ class OrderManager:
                 self.state.session_pnl = self.trader.current_pnl
 
                 if self._risk_manager:
-                    self._risk_manager.update_equity(self.bankroll)
                     total_exposure = sum(
                         float(p.size * p.avg_entry_price)
                         for p in self.trader.current_positions.values()
                     )
+                    equity = self.bankroll + total_exposure
+                    self._risk_manager.update_equity(equity)
                     self._risk_manager.update_exposure(total_exposure)
 
                 signal = self.strategy.generate_signal(self.state, self.bankroll)

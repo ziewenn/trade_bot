@@ -49,17 +49,21 @@ class PaperTrader(TraderInterface):
         self._shared_state.total_trades = self._total_trades
         self._shared_state.winning_trades = self._winning_trades
 
-    def _record_recent_trade(self, token_id: str, pnl: Decimal, cost: float):
+    def _record_recent_trade(self, token_id: str, pnl: Decimal, cost: float, side: str = ""):
         """Record a completed trade for the dashboard's recent trades display."""
         if self._shared_state is None:
             return
-        market = self._shared_state.current_market
-        side = "?"
-        if market:
-            if token_id == market.token_id_up:
-                side = "UP"
-            elif token_id == market.token_id_down:
-                side = "DOWN"
+        if not side:
+            market = self._shared_state.current_market
+            if market:
+                if token_id == market.token_id_up:
+                    side = "UP"
+                elif token_id == market.token_id_down:
+                    side = "DOWN"
+                else:
+                    side = "?"
+            else:
+                side = "?"
         self._shared_state.recent_trades.append({
             "side": side,
             "pnl": float(pnl),
@@ -333,6 +337,7 @@ class PaperTrader(TraderInterface):
         self,
         winning_token_id: str,
         losing_token_id: str,
+        outcome: str = "",
     ):
         """Handle market resolution — winning shares pay $1, losing pay $0.
 
@@ -356,7 +361,8 @@ class PaperTrader(TraderInterface):
                 closed_at=now,
             )
             cost = float(pos.avg_entry_price * pos.size)
-            self._record_recent_trade(winning_token_id, pnl, cost)
+            win_side = outcome if outcome else "UP"
+            self._record_recent_trade(winning_token_id, pnl, cost, side=win_side)
             del self._positions[winning_token_id]
 
             self._total_trades += 1
@@ -382,7 +388,8 @@ class PaperTrader(TraderInterface):
                 closed_at=now,
             )
             cost = float(pos.avg_entry_price * pos.size)
-            self._record_recent_trade(losing_token_id, pnl, cost)
+            lose_side = "DOWN" if outcome == "UP" else "UP"
+            self._record_recent_trade(losing_token_id, pnl, cost, side=lose_side)
             del self._positions[losing_token_id]
 
             self._total_trades += 1

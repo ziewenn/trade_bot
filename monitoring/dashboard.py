@@ -303,17 +303,27 @@ class Dashboard:
         rs = self.risk.risk_state
         halt_text = f"[red bold]HALTED: {rs.halt_reason}[/]" if rs.is_halted else "[green]Active[/]"
 
-        # Use paper bankroll if synced, otherwise fall back to risk state
-        bankroll = float(self.state.paper_bankroll) if self.state.paper_bankroll > 0 else rs.bankroll
-        daily_pnl = float(self.state.session_pnl)
-        daily_pnl_color = "green" if daily_pnl >= 0 else "red"
+        # Cash = paper_bankroll, Equity = cash + position cost (at entry)
+        cash = float(self.state.paper_bankroll) if self.state.paper_bankroll > 0 else rs.bankroll
+        position_cost = sum(
+            float(p.avg_entry_price * p.size)
+            for p in self.state.open_positions.values()
+        )
+        equity = cash + position_cost
+        starting = self.state.starting_bankroll
+        actual_pnl = equity - starting
+        actual_pnl_color = "green" if actual_pnl >= 0 else "red"
+        realized_pnl = float(self.state.session_pnl)
+        realized_pnl_color = "green" if realized_pnl >= 0 else "red"
         drawdown = self.risk.drawdown_from_peak
         drawdown_color = "red" if drawdown > self.settings.drawdown_halt_pct * 0.5 else "yellow"
 
         rows = [
             f"  Status:     {halt_text}",
-            f"  Bankroll:   ${bankroll:,.2f}",
-            f"  Daily P&L:  [{daily_pnl_color}]${daily_pnl:+,.2f}[/]  (limit: ${bankroll * self.settings.daily_loss_limit_pct:,.2f})",
+            f"  Equity:     ${equity:,.2f}  [dim](cash: ${cash:,.2f})[/]",
+            f"  Started:    ${starting:,.2f}",
+            f"  Total P&L:  [{actual_pnl_color}]${actual_pnl:+,.2f}[/]  ({actual_pnl/starting*100 if starting > 0 else 0:+,.1f}%)",
+            f"  Realized:   [{realized_pnl_color}]${realized_pnl:+,.2f}[/]",
             f"  Drawdown:   [{drawdown_color}]{drawdown:.2%}[/]  (halt: {self.settings.drawdown_halt_pct:.0%})",
             f"  Exposure:   {self.risk.exposure_pct:.1%}  (max: {self.settings.max_concurrent_exposure_pct:.0%})",
         ]
