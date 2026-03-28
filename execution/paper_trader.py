@@ -49,6 +49,27 @@ class PaperTrader(TraderInterface):
         self._shared_state.total_trades = self._total_trades
         self._shared_state.winning_trades = self._winning_trades
 
+    def _record_recent_trade(self, token_id: str, pnl: Decimal, cost: float):
+        """Record a completed trade for the dashboard's recent trades display."""
+        if self._shared_state is None:
+            return
+        market = self._shared_state.current_market
+        side = "?"
+        if market:
+            if token_id == market.token_id_up:
+                side = "UP"
+            elif token_id == market.token_id_down:
+                side = "DOWN"
+        self._shared_state.recent_trades.append({
+            "side": side,
+            "pnl": float(pnl),
+            "cost": cost,
+            "won": float(pnl) > 0,
+            "time": time.time(),
+        })
+        if len(self._shared_state.recent_trades) > 5:
+            self._shared_state.recent_trades = self._shared_state.recent_trades[-5:]
+
     async def place_order(
         self,
         token_id: str,
@@ -295,13 +316,12 @@ class PaperTrader(TraderInterface):
 
                 existing.size -= close_size
                 if existing.size <= 0:
-                    # Position fully closed — count as one completed trade
                     self._total_trades += 1
                     if pnl > 0:
                         self._winning_trades += 1
+                    self._record_recent_trade(token_id, pnl, float(existing.avg_entry_price * close_size))
                     del self._positions[token_id]
 
-                    # Record position close in DB
                     await self.db.close_position(
                         token_id=token_id,
                         close_price=fill_price,
@@ -335,6 +355,8 @@ class PaperTrader(TraderInterface):
                 pnl=pnl,
                 closed_at=now,
             )
+            cost = float(pos.avg_entry_price * pos.size)
+            self._record_recent_trade(winning_token_id, pnl, cost)
             del self._positions[winning_token_id]
 
             self._total_trades += 1
@@ -359,6 +381,8 @@ class PaperTrader(TraderInterface):
                 pnl=pnl,
                 closed_at=now,
             )
+            cost = float(pos.avg_entry_price * pos.size)
+            self._record_recent_trade(losing_token_id, pnl, cost)
             del self._positions[losing_token_id]
 
             self._total_trades += 1

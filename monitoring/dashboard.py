@@ -77,6 +77,7 @@ class Dashboard:
         layout["right"].split_column(
             Layout(name="positions", size=8),
             Layout(name="risk", size=8),
+            Layout(name="recent_trades", size=9),
             Layout(name="stats", size=9),
         )
 
@@ -86,6 +87,7 @@ class Dashboard:
         layout["orders"].update(self._orders_panel())
         layout["positions"].update(self._positions_panel())
         layout["risk"].update(self._risk_panel())
+        layout["recent_trades"].update(self._recent_trades_panel())
         layout["stats"].update(self._stats_panel())
         layout["footer"].update(self._footer_panel())
 
@@ -316,6 +318,40 @@ class Dashboard:
             f"  Exposure:   {self.risk.exposure_pct:.1%}  (max: {self.settings.max_concurrent_exposure_pct:.0%})",
         ]
         return Panel("\n".join(rows), title="Risk")
+
+    def _recent_trades_panel(self) -> Panel:
+        table = Table(show_header=True, header_style="bold", expand=True, padding=(0, 1))
+        table.add_column("Side", width=5)
+        table.add_column("Result", width=6)
+        table.add_column("P&L", width=10)
+        table.add_column("Cost", width=8)
+        table.add_column("Ago", width=8)
+
+        trades = self.state.recent_trades
+        for trade in reversed(trades):
+            side_color = "green" if trade["side"] == "UP" else "red" if trade["side"] == "DOWN" else "dim"
+            result = "WIN" if trade["won"] else "LOSS"
+            result_color = "green" if trade["won"] else "red"
+            pnl = trade["pnl"]
+            pnl_color = "green" if pnl >= 0 else "red"
+            ago = int(time.time() - trade["time"])
+            if ago < 60:
+                ago_str = f"{ago}s"
+            else:
+                ago_str = f"{ago // 60}m"
+
+            table.add_row(
+                f"[{side_color}]{trade['side']}[/]",
+                f"[{result_color}]{result}[/]",
+                f"[{pnl_color}]${pnl:+,.2f}[/]",
+                f"${trade['cost']:,.2f}",
+                ago_str,
+            )
+
+        if not trades:
+            table.add_row("[dim]-[/]", "[dim]-[/]", "[dim]-[/]", "[dim]-[/]", "[dim]-[/]")
+
+        return Panel(table, title=f"Recent Trades ({len(trades)})")
 
     def _stats_panel(self) -> Panel:
         total = self.state.total_trades

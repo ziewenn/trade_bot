@@ -121,11 +121,32 @@ class Strategy:
         if anchor <= 0 or current <= 0:
             return None
 
-        # Require minimum price gaps to filter noise.
-        # Binance gap: uses max(binance, chainlink) since Binance leads.
-        # Chainlink gap: MUST also have a meaningful gap since Chainlink
-        # resolves the market. A tiny Chainlink gap ($3) can easily flip
-        # even if Binance is far away — Chainlink hasn't confirmed the move yet.
+        # Always compute and display edge/direction for dashboard,
+        # even when trade filters below will block execution.
+        w = self._binance_weight
+        predicted_price = (1 - w) * current + w * binance
+        chainlink_says_up = current > anchor
+        binance_says_up = binance > anchor
+
+        true_prob_up = self.estimate_probability(
+            current_price=predicted_price,
+            anchor_price=anchor,
+            remaining_seconds=remaining,
+            volatility_per_second=self._calibrated_vol,
+        )
+
+        market_prob_up = self._get_market_prob_up(state)
+        if market_prob_up is not None:
+            if chainlink_says_up:
+                edge = true_prob_up - market_prob_up
+            else:
+                edge = (1.0 - true_prob_up) - (1.0 - market_prob_up)
+            state.current_true_prob = true_prob_up
+            state.current_edge = edge
+            state.current_signal_direction = "UP" if chainlink_says_up else "DOWN"
+
+        # --- Trade filters (block execution, not dashboard) ---
+
         chainlink_gap = abs(current - anchor)
         binance_gap = abs(binance - anchor)
         price_gap = max(chainlink_gap, binance_gap)
@@ -140,9 +161,6 @@ class Strategy:
             )
             return None
 
-        # Chainlink must have moved at least 25% of the min gap threshold.
-        # If Chainlink is only $3 from anchor while Binance is $200 away,
-        # Chainlink hasn't confirmed the move and could easily flip direction.
         min_chainlink_gap = self._min_price_gap * 0.25
         if chainlink_gap < min_chainlink_gap:
             logger.info(
@@ -154,56 +172,34 @@ class Strategy:
             )
             return None
 
-        # Only trade when Binance CONFIRMS Chainlink direction.
-        # Both must agree on which side of the anchor BTC is on.
-        chainlink_says_up = current > anchor
-        binance_says_up = binance > anchor
         if chainlink_says_up != binance_says_up:
             logger.info(
-                "signal_skip",
+                "signal_note",
                 reason="binance_chainlink_disagree",
                 chainlink=round(current, 2),
                 binance=round(binance, 2),
                 anchor=round(anchor, 2),
+                trading_direction="UP" if chainlink_says_up else "DOWN",
             )
-            return None
 
-        # Verify Binance move is sustained (not a single-tick spike).
-        # Check last 5 seconds of Binance ticks — at least 80% must agree on direction.
+        # Verify Binance price is not wildly spiking (check tick-to-tick stability).
         now_ms = int(time.time() * 1000)
-        recent_cutoff = now_ms - 5000  # last 5 seconds
+        recent_cutoff = now_ms - 5000
         recent_ticks = [(ts, float(p)) for ts, p in state.price_history if ts >= recent_cutoff]
 
-        if len(recent_ticks) >= 3:  # need at least 3 ticks to judge
-            ticks_agreeing = sum(1 for _, p in recent_ticks if (p > anchor) == binance_says_up)
-            agreement_pct = ticks_agreeing / len(recent_ticks)
-            if agreement_pct < 0.80:
+        if len(recent_ticks) >= 3:
+            prices = [p for _, p in recent_ticks]
+            avg_price = sum(prices) / len(prices)
+            max_deviation = max(abs(p - avg_price) for p in prices)
+            if max_deviation > 100:
                 logger.info(
                     "signal_skip",
-                    reason="binance_momentum_unstable",
-                    agreement_pct=round(agreement_pct, 2),
+                    reason="binance_price_spiking",
+                    max_deviation=round(max_deviation, 2),
                     ticks_checked=len(recent_ticks),
-                    direction="UP" if binance_says_up else "DOWN",
                 )
                 return None
 
-        # Blend Chainlink (confirmed) with Binance (leading indicator) to
-        # predict where Chainlink will be at resolution. Binance moves first,
-        # Chainlink follows — so incorporating Binance gives us a forward-looking
-        # estimate. Works for both UP and DOWN directions symmetrically.
-        w = self._binance_weight
-        predicted_price = (1 - w) * current + w * binance
-
-        # Estimate true probability using the blended predicted price
-        true_prob_up = self.estimate_probability(
-            current_price=predicted_price,
-            anchor_price=anchor,
-            remaining_seconds=remaining,
-            volatility_per_second=self._calibrated_vol,
-        )
-
-        # Get market-implied probability from orderbook
-        market_prob_up = self._get_market_prob_up(state)
         if market_prob_up is None:
             logger.info(
                 "signal_skip",
@@ -215,9 +211,6 @@ class Strategy:
             )
             return None
 
-        # Only trade IN the direction Chainlink indicates — never against it.
-        # If Chainlink is above anchor, only buy UP. If below, only buy DOWN.
-        # Betting against the resolution oracle's current direction is a losing strategy.
         if chainlink_says_up:
             direction = "UP"
             edge = true_prob_up - market_prob_up
@@ -233,31 +226,11 @@ class Strategy:
             best_bid = state.best_bid_down
             market_price = market_prob_down
 
-        # Update dashboard state even if we don't trade — helps debugging
-        state.current_true_prob = true_prob_up
-        state.current_edge = edge
-        state.current_signal_direction = direction
-
-        # Check minimum edge — only trade if we think our side is underpriced
-        if edge < self.min_edge:
-            logger.info(
-                "signal_skip",
-                reason="insufficient_edge",
-                direction=direction,
-                edge=round(edge, 4),
-                min_required=self.min_edge,
-                true_prob=round(true_prob_up, 4),
-                market_prob=round(market_prob_up, 4),
-                predicted_price=round(predicted_price, 2),
-                chainlink=round(current, 2),
-                binance=round(binance, 2),
-            )
-            return None
-
         if best_bid is None:
             return None
 
-        # Calculate position size
+        # Calculate position size — use Kelly when edge is positive,
+        # otherwise use max_position_pct as fixed size
         size = self.kelly_size(
             estimated_prob=true_prob_up if direction == "UP" else (1.0 - true_prob_up),
             market_price=market_price,
@@ -267,7 +240,7 @@ class Strategy:
         )
 
         if size <= 0:
-            return None
+            size = bankroll * self.max_position_pct
 
         # Check concurrent exposure
         current_exposure = sum(
@@ -282,11 +255,6 @@ class Strategy:
 
         # Select maker order price: improve the best bid
         order_price = best_bid + self.order_offset
-
-        # Update strategy state for dashboard
-        state.current_true_prob = true_prob_up
-        state.current_edge = edge
-        state.current_signal_direction = direction
 
         logger.info(
             "signal_generated",

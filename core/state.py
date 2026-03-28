@@ -60,6 +60,9 @@ class SharedState:
     session_pnl: Decimal = Decimal("0")
     paper_bankroll: Decimal = Decimal("0")  # Synced from PaperTrader
 
+    # Recent trades for dashboard display: list of (direction, pnl, cost, timestamp)
+    recent_trades: list[dict] = field(default_factory=list)
+
     # RTDS btc/usd (Chainlink Data Streams) continuous tracking
     # This is close to Polymarket's display price but NOT exact for anchoring.
     # Used as interim approximation; authoritative anchor comes from Gamma API.

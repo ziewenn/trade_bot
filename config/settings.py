@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     daily_loss_limit_pct: float = 0.03
     drawdown_halt_pct: float = 0.08
     kelly_fraction: float = 0.25
-    min_edge_pct: float = 0.02
+    min_edge_pct: float = 0.0
     max_concurrent_exposure_pct: float = 0.15
 
     # Strategy parameters
@@ -36,10 +36,10 @@ class Settings(BaseSettings):
     momentum_threshold_pct: float = 0.0003
     order_offset_cents: float = 0.01
     cancel_replace_interval_ms: int = 500
-    market_entry_window_sec: int = 240  # Trade within first 4 min of 5-min window
-    market_entry_min_elapsed_sec: int = 180  # Don't enter before 3 min elapsed
+    market_entry_window_sec: int = 300  # Allow entry for entire 5-min cycle (exit_buffer still applies)
+    market_entry_min_elapsed_sec: int = 0  # No minimum elapsed time restriction
     market_exit_buffer_sec: int = 30
-    min_price_gap_usd: float = 50.0  # Min price gap (max of binance/chainlink) to trade
+    min_price_gap_usd: float = 20.0  # Min price gap (max of binance/chainlink) to trade
     binance_prediction_weight: float = 0.4  # Blend weight: 0=Chainlink only, 1=Binance only
 
     # Stale data thresholds

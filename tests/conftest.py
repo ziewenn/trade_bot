@@ -28,7 +28,7 @@ def settings():
         market_entry_window_sec=240,
         market_entry_min_elapsed_sec=180,
         market_exit_buffer_sec=30,
-        min_price_gap_usd=50.0,
+        min_price_gap_usd=20.0,
         binance_prediction_weight=0.4,
         order_offset_cents=0.01,
         cancel_replace_interval_ms=500,
