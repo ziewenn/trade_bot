@@ -60,6 +60,7 @@ class SharedState:
     session_pnl: Decimal = Decimal("0")
     paper_bankroll: Decimal = Decimal("0")  # Synced from PaperTrader
     starting_bankroll: float = 0.0  # Set once at init for dashboard verification
+    trading_paused: bool = False  # Web dashboard start/stop control
 
     # Recent trades for dashboard display: list of (direction, pnl, cost, timestamp)
     recent_trades: list[dict] = field(default_factory=list)

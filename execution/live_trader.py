@@ -56,7 +56,14 @@ class LiveTrader(TraderInterface):
             creds = self._client.create_or_derive_api_creds()
             self._client.set_api_creds(creds)
             self._initialized = True
-            logger.info("live_trader_initialized")
+
+            # Immediately sync real balance from Polymarket
+            await self.sync_state()
+            logger.info(
+                "live_trader_initialized",
+                usdc_balance=float(self._bankroll),
+                positions=len(self._positions),
+            )
 
         except ImportError:
             raise RuntimeError(
@@ -176,8 +183,12 @@ class LiveTrader(TraderInterface):
             return {"usdc": self._bankroll, "positions": {}}
 
         try:
-            balance_wei = self._client.get_balance()
-            usdc = Decimal(str(int(balance_wei))) / Decimal("1000000")
+            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            result = self._client.get_balance_allowance(params)
+            balance_str = result.get("balance", "0") if isinstance(result, dict) else "0"
+            usdc = Decimal(balance_str) / Decimal("1000000")
             return {"usdc": usdc, "positions": {
                 tid: pos.size for tid, pos in self._positions.items()
             }}
@@ -190,6 +201,9 @@ class LiveTrader(TraderInterface):
 
         Called every order manager cycle to keep bankroll, positions,
         and P&L in sync with the exchange.
+
+        Uses get_balance_allowance for USDC balance (the SDK's correct method)
+        and get_trades to reconstruct open positions from recent fills.
         """
         if not self._initialized:
             return
@@ -199,29 +213,55 @@ class LiveTrader(TraderInterface):
             return
         self._last_sync_mono = now
 
+        # Sync positions from recent trades
         try:
-            raw_positions = self._client.get_positions()
+            from py_clob_client.clob_types import TradeParams
+
+            trades = self._client.get_trades()
+            # Build net positions from trade history
+            net: dict[str, dict] = {}  # token_id -> {size, cost, condition_id}
+            if isinstance(trades, list):
+                for t in trades:
+                    token_id = t.get("asset_id", "")
+                    if not token_id:
+                        continue
+                    side = t.get("side", "BUY")
+                    size = Decimal(str(t.get("size", "0")))
+                    price = Decimal(str(t.get("price", "0")))
+
+                    if token_id not in net:
+                        net[token_id] = {"size": Decimal("0"), "cost": Decimal("0"), "condition_id": ""}
+
+                    if side == "BUY":
+                        net[token_id]["size"] += size
+                        net[token_id]["cost"] += size * price
+                    else:
+                        net[token_id]["size"] -= size
+                        net[token_id]["cost"] -= size * price
+
             new_positions: dict[str, Position] = {}
-            for raw in raw_positions:
-                token_id = raw["asset"]["token_id"]
-                condition_id = raw["asset"].get("condition_id", "")
-                size = Decimal(str(raw["size"]))
-                avg_price = Decimal(str(raw["avgPrice"]))
-                if size > 0:
+            for token_id, data in net.items():
+                if data["size"] > 0:
+                    avg_price = data["cost"] / data["size"] if data["size"] > 0 else Decimal("0")
                     new_positions[token_id] = Position(
                         token_id=token_id,
                         outcome="",
-                        size=size,
+                        size=data["size"],
                         avg_entry_price=avg_price,
-                        market_condition_id=condition_id,
+                        market_condition_id=data["condition_id"],
                     )
             self._positions = new_positions
         except Exception as e:
             logger.warning("live_sync_positions_failed", error=str(e))
 
+        # Sync USDC balance
         try:
-            balance_wei = self._client.get_balance()
-            self._bankroll = Decimal(str(int(balance_wei))) / Decimal("1000000")
+            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            result = self._client.get_balance_allowance(params)
+            balance_str = result.get("balance", "0") if isinstance(result, dict) else "0"
+            self._bankroll = Decimal(balance_str) / Decimal("1000000")
         except Exception as e:
             logger.warning("live_sync_balance_failed", error=str(e))
 

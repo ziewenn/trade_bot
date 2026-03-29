@@ -131,6 +131,17 @@ class Bot:
             )
             await live_trader.initialize()
             self.trader = live_trader
+            # Use real equity from Polymarket as starting bankroll
+            real_balance = float(live_trader.current_bankroll)
+            position_cost = sum(
+                float(p.avg_entry_price * p.size) 
+                for p in live_trader.current_positions.values()
+            )
+            total_equity = real_balance + position_cost
+            if total_equity >= 0:
+                self.state.starting_bankroll = total_equity
+                self.settings.initial_bankroll = total_equity
+                logger.info("live_equity_synced", equity=total_equity, cash=real_balance)
         elif self.settings.trading_mode == "sim-live":
             from execution.simulated_live_trader import SimulatedLiveTrader
 
@@ -204,17 +215,16 @@ class Bot:
                     tg.create_task(self.dashboard.run())
                 tg.create_task(self.alerts.start())
 
-                # Web dashboard (for remote monitoring)
-                if self.settings.dashboard_enabled:
-                    from monitoring.web_dashboard import WebDashboard
+                # Web dashboard (always enabled for web UI control)
+                from monitoring.web_dashboard import WebDashboard
 
-                    web = WebDashboard(
-                        self.settings,
-                        self.state,
-                        self.risk_manager,
-                        self.order_manager,
-                    )
-                    tg.create_task(web.run())
+                web = WebDashboard(
+                    self.settings,
+                    self.state,
+                    self.risk_manager,
+                    self.order_manager,
+                )
+                tg.create_task(web.run())
 
                 # DB maintenance
                 tg.create_task(self._cleanup_loop())

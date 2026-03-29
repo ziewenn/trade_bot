@@ -174,6 +174,17 @@ class OrderManager:
         await self._post_limiter.acquire()
 
         try:
+            if self._risk_manager:
+                total_exposure = sum(
+                    float(p.size * p.avg_entry_price)
+                    for p in self.trader.current_positions.values()
+                )
+                current_equity = self.bankroll + total_exposure
+                is_allowed = await self._risk_manager.check_pre_trade(signal, current_equity)
+                if not is_allowed:
+                    logger.debug("pre_trade_rejected")
+                    return
+
             market = self.state.current_market
             condition_id = market.condition_id if market else ""
 

@@ -85,9 +85,9 @@ class Settings(BaseSettings):
     sim_slippage_cents: float = 0.015   # 1.5¢ slippage (vs 0.5¢ paper)
 
     # Web dashboard
-    dashboard_enabled: bool = False
+    dashboard_enabled: bool = True
     dashboard_port: int = 8080
-    dashboard_host: str = "0.0.0.0"
+    dashboard_host: str = "127.0.0.1"
     dashboard_password: str = "changeme"
 
     @model_validator(mode="after")
@@ -101,8 +101,8 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "POLYMARKET_FUNDER_ADDRESS is required for live trading mode"
                 )
-            if self.dashboard_enabled and self.dashboard_password == "changeme":
+            if self.dashboard_password == "changeme":
                 raise ValueError(
-                    "DASHBOARD_PASSWORD must be changed from default 'changeme' in live mode"
+                    "DASHBOARD_PASSWORD must be changed from default 'changeme' in live mode for the web UI"
                 )
         return self
