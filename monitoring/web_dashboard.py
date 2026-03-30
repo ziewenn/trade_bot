@@ -16,6 +16,7 @@ from config.settings import Settings
 from core.order_manager import OrderManager
 from core.risk_manager import RiskManager
 from core.state import SharedState
+from monitoring.alerts import TelegramAlerts
 from monitoring.logger import get_logger
 
 logger = get_logger("web_dashboard")
@@ -39,11 +40,13 @@ class WebDashboard:
         state: SharedState,
         risk_manager: RiskManager,
         order_manager: OrderManager,
+        alerts: TelegramAlerts,
     ):
         self.settings = settings
         self.state = state
         self.risk = risk_manager
         self.orders = order_manager
+        self.alerts = alerts
         self._trading_paused = True  # Start paused — user must click Start on Web UI
         self.state.trading_paused = True
 
@@ -121,6 +124,7 @@ class WebDashboard:
                 self.risk.risk_state.is_halted = False
                 self.risk.risk_state.halt_reason = None
             logger.info("trading_resumed_via_web")
+            asyncio.create_task(self.alerts.send_alert("▶️ <b>Trading Resumed</b>\nBot is now actively looking for trades."))
             return JSONResponse({"status": "started", "message": "Trading resumed"})
 
         @app.post("/api/stop")
@@ -139,6 +143,7 @@ class WebDashboard:
             self.risk.risk_state.is_halted = True
             self.risk.risk_state.halt_reason = "user_paused"
             logger.info("trading_paused_via_web")
+            asyncio.create_task(self.alerts.send_alert("⏸️ <b>Trading Paused</b>\nBot stopped via Web UI. Orders cancelled."))
             return JSONResponse({"status": "stopped", "message": "Trading paused, orders cancelled"})
 
     def _serialize_state(self) -> dict:

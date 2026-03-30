@@ -108,20 +108,25 @@ class OrderManager:
                     self._risk_manager.update_equity(equity)
                     self._risk_manager.update_exposure(total_exposure)
 
-                signal = self.strategy.generate_signal(self.state, self.bankroll)
-
-                # Check if we should exit positions
-                if self.strategy.should_exit(self.state):
-                    await self._exit_all_positions()
-                    self._current_signal = None
-                elif signal:
-                    await self._update_orders(signal)
-                    self._current_signal = signal
-                else:
-                    # No signal — cancel stale orders
+                if self.state.trading_paused:
                     if self._active_orders:
                         await self.cancel_all()
                     self._current_signal = None
+                else:
+                    signal = self.strategy.generate_signal(self.state, self.bankroll)
+
+                    # Check if we should exit positions
+                    if self.strategy.should_exit(self.state):
+                        await self._exit_all_positions()
+                        self._current_signal = None
+                    elif signal:
+                        await self._update_orders(signal)
+                        self._current_signal = signal
+                    else:
+                        # No signal — cancel stale orders
+                        if self._active_orders:
+                            await self.cancel_all()
+                        self._current_signal = None
 
             except Exception as e:
                 logger.error(

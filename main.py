@@ -223,6 +223,7 @@ class Bot:
                     self.state,
                     self.risk_manager,
                     self.order_manager,
+                    self.alerts,
                 )
                 tg.create_task(web.run())
 
@@ -638,10 +639,39 @@ class Bot:
                 market=old_market.event_slug,
             )
 
+            # Check positions for P&L alert before resolving
+            total_cost = 0.0
+            total_payout = 0.0
+            had_positions = False
+            for token_id in [winning_token, losing_token]:
+                if token_id in self.state.open_positions:
+                    pos = self.state.open_positions[token_id]
+                    # size is number of shares, avg_entry_price is decimal
+                    cost = float(pos.size * pos.avg_entry_price)
+                    payout = float(pos.size) if token_id == winning_token else 0.0
+                    total_cost += cost
+                    total_payout += payout
+                    had_positions = True
+
+            pnl = total_payout - total_cost
+
             await self.trader.resolve_market(
                 winning_token, losing_token,
                 outcome="UP" if btc_went_up else "DOWN",
             )
+
+            # Send Telegram Alert if we had positions
+            if had_positions:
+                emoji = "🎉" if pnl > 0 else ("💀" if pnl < 0 else "😐")
+                status = "WON" if pnl > 0 else ("LOST" if pnl < 0 else "BREAK EVEN")
+                msg = (
+                    f"{emoji} <b>Trade Resolved: {status}</b>\n"
+                    f"Market: {old_market.event_slug}\n"
+                    f"Position Cost: ${total_cost:.2f}\n"
+                    f"Payout: ${total_payout:.2f}\n"
+                    f"Net P&L: <b>${pnl:+.2f}</b>"
+                )
+                asyncio.create_task(self.alerts.send_alert(msg))
 
         except Exception as e:
             logger.error(
