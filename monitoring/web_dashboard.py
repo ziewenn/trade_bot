@@ -1,4 +1,4 @@
-"""Lightweight FastAPI web dashboard with SSE for real-time updates."""
+"""Lightweight FastAPI web dashboard with SSE for real-time updates + trading controls."""
 
 import asyncio
 import json
@@ -9,13 +9,14 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from config.settings import Settings
 from core.order_manager import OrderManager
 from core.risk_manager import RiskManager
 from core.state import SharedState
+from monitoring.alerts import TelegramAlerts
 from monitoring.logger import get_logger
 
 logger = get_logger("web_dashboard")
@@ -39,11 +40,19 @@ class WebDashboard:
         state: SharedState,
         risk_manager: RiskManager,
         order_manager: OrderManager,
+        alerts: TelegramAlerts,
     ):
         self.settings = settings
         self.state = state
         self.risk = risk_manager
         self.orders = order_manager
+        self.alerts = alerts
+        self._trading_paused = True  # Start paused — user must click Start on Web UI
+        self.state.trading_paused = True
+
+        # Set risk halt so no trades are placed until user starts via Web UI
+        self.risk.risk_state.is_halted = True
+        self.risk.risk_state.halt_reason = "user_paused"
 
         self.app = FastAPI(title="Polymarket Bot Dashboard", docs_url=None, redoc_url=None)
         self._setup_routes()
@@ -99,9 +108,43 @@ class WebDashboard:
                 headers={
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",  # Disable nginx buffering
+                    "X-Accel-Buffering": "no",
                 },
             )
+
+        # --- Trading Controls ---
+        @app.post("/api/start")
+        async def start_trading(credentials: HTTPBasicCredentials = Depends(self._verify_auth)):
+            """Resume trading (unpause the order manager)."""
+            if not self._trading_paused:
+                return JSONResponse({"status": "already_running", "message": "Trading is already active"})
+            self._trading_paused = False
+            self.state.trading_paused = False
+            if self.risk.is_halted and self.risk.risk_state.halt_reason == "user_paused":
+                self.risk.risk_state.is_halted = False
+                self.risk.risk_state.halt_reason = None
+            logger.info("trading_resumed_via_web")
+            asyncio.create_task(self.alerts.send_alert("▶️ <b>Trading Resumed</b>\nBot is now actively looking for trades."))
+            return JSONResponse({"status": "started", "message": "Trading resumed"})
+
+        @app.post("/api/stop")
+        async def stop_trading(credentials: HTTPBasicCredentials = Depends(self._verify_auth)):
+            """Pause trading — cancel all orders and halt new ones."""
+            if self._trading_paused:
+                return JSONResponse({"status": "already_stopped", "message": "Trading is already paused"})
+            self._trading_paused = True
+            self.state.trading_paused = True
+            # Cancel all open orders immediately
+            try:
+                await self.orders.cancel_all()
+            except Exception as e:
+                logger.error("stop_cancel_failed", error=str(e))
+            # Set risk halt so no new trades are placed
+            self.risk.risk_state.is_halted = True
+            self.risk.risk_state.halt_reason = "user_paused"
+            logger.info("trading_paused_via_web")
+            asyncio.create_task(self.alerts.send_alert("⏸️ <b>Trading Paused</b>\nBot stopped via Web UI. Orders cancelled."))
+            return JSONResponse({"status": "stopped", "message": "Trading paused, orders cancelled"})
 
     def _serialize_state(self) -> dict:
         """Convert bot state to JSON-serializable dict."""
@@ -118,8 +161,15 @@ class WebDashboard:
         remaining = s.get_remaining_seconds()
         r_mins, r_secs = divmod(int(remaining), 60)
 
-        # Bankroll
-        bankroll = float(s.paper_bankroll) if s.paper_bankroll > 0 else rs.bankroll
+        # Equity = cash + position cost
+        cash = float(s.paper_bankroll) if s.paper_bankroll > 0 else rs.bankroll
+        position_cost = sum(
+            float(p.avg_entry_price * p.size)
+            for p in s.open_positions.values()
+        )
+        bankroll = cash + position_cost
+        starting = s.starting_bankroll
+        actual_pnl = bankroll - starting if starting > 0 else 0
 
         # Stats
         total = s.total_trades
@@ -141,7 +191,6 @@ class WebDashboard:
         # Positions — calculate live uPnL and potential outcomes
         positions_list = []
         for pos in s.open_positions.values():
-            # Determine side
             side = "?"
             current_bid = None
             if market:
@@ -166,19 +215,40 @@ class WebDashboard:
                 "if_win": profit_if_win,
             })
 
-        # Price delta
+        # Price deltas
         price_delta = None
-        if market and market.anchor_price and s.binance_price > 0:
-            price_delta = float(s.binance_price - market.anchor_price)
+        chainlink_delta = None
+        if market and market.anchor_price:
+            if s.binance_price > 0:
+                price_delta = float(s.binance_price - market.anchor_price)
+            if s.chainlink_price > 0:
+                chainlink_delta = float(s.chainlink_price - market.anchor_price)
 
         # Potential outcomes from all positions
         total_cost = sum(p["cost"] for p in positions_list)
         total_shares = sum(p["shares"] for p in positions_list)
         win_profit = total_shares * 1.0 - total_cost if total_shares > 0 else 0
 
+        # Chainlink source & age
+        cl_age = time.monotonic() - s.chainlink_tick_time if s.chainlink_tick_time > 0 else -1
+        cl_source = getattr(s, "chainlink_source", "") or ""
+
+        # Recent trades
+        recent_trades = []
+        for trade in reversed(s.recent_trades):
+            ago = int(time.time() - trade["time"])
+            recent_trades.append({
+                "side": trade["side"],
+                "won": trade["won"],
+                "pnl": trade["pnl"],
+                "cost": trade["cost"],
+                "ago": f"{ago}s" if ago < 60 else f"{ago // 60}m",
+            })
+
         return {
             "mode": self.settings.trading_mode.upper(),
             "uptime": f"{hours:02d}:{minutes:02d}:{secs:02d}",
+            "trading_paused": self._trading_paused,
             "feeds": {
                 "binance": s.binance_connected,
                 "polymarket": s.polymarket_connected,
@@ -187,8 +257,13 @@ class WebDashboard:
             "market": {
                 "slug": market.event_slug if market else None,
                 "anchor": float(market.anchor_price) if market and market.anchor_price else None,
+                "anchor_source": getattr(s, "anchor_source", "") or "",
+                "anchor_authoritative": getattr(s, "anchor_is_authoritative", False),
                 "binance_price": float(s.binance_price),
                 "chainlink_price": float(s.chainlink_price),
+                "chainlink_source": cl_source,
+                "chainlink_age": round(cl_age, 1) if cl_age >= 0 else -1,
+                "chainlink_delta": chainlink_delta,
                 "price_delta": price_delta,
                 "remaining": f"{r_mins}:{r_secs:02d}",
                 "remaining_seconds": remaining,
@@ -208,20 +283,27 @@ class WebDashboard:
                 "halted": rs.is_halted,
                 "halt_reason": rs.halt_reason,
                 "bankroll": bankroll,
+                "starting": starting,
+                "actual_pnl": actual_pnl,
+                "actual_pnl_pct": (actual_pnl / starting * 100) if starting > 0 else 0,
+                "realized_pnl": pnl,
                 "daily_pnl": pnl,
                 "daily_limit": bankroll * self.settings.daily_loss_limit_pct,
                 "drawdown": self.risk.drawdown_from_peak,
                 "drawdown_halt": self.settings.drawdown_halt_pct,
                 "exposure": self.risk.exposure_pct,
                 "max_exposure": self.settings.max_concurrent_exposure_pct,
+                "cash": cash,
             },
             "stats": {
                 "trades": total,
+                "wins": wins,
                 "win_rate": win_rate,
                 "session_pnl": pnl,
                 "avg_latency_ms": self.orders.avg_cancel_replace_latency_ms,
                 "peak_equity": rs.peak_equity,
             },
+            "recent_trades": recent_trades,
         }
 
     async def run(self):
@@ -235,7 +317,7 @@ class WebDashboard:
             self.app,
             host=self.settings.dashboard_host,
             port=self.settings.dashboard_port,
-            log_level="warning",  # Suppress uvicorn access logs
+            log_level="warning",
             access_log=False,
         )
         server = uvicorn.Server(config)

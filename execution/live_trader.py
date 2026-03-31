@@ -38,6 +38,7 @@ class LiveTrader(TraderInterface):
         self._positions: dict[str, Position] = {}
         self._realized_pnl = Decimal("0")
         self._last_sync_mono: float = 0.0
+        self._last_trade_timestamp: Optional[int] = None  # For incremental get_trades
 
     async def initialize(self):
         """Initialize the CLOB client and derive API credentials."""
@@ -48,7 +49,7 @@ class LiveTrader(TraderInterface):
                 host=self._clob_url,
                 key=self._private_key,
                 chain_id=self._chain_id,
-                signature_type=0,  # EOA wallet
+                signature_type=1,  # Polymarket proxy wallet (email/Google login)
                 funder=self._funder_address,
             )
 
@@ -56,7 +57,21 @@ class LiveTrader(TraderInterface):
             creds = self._client.create_or_derive_api_creds()
             self._client.set_api_creds(creds)
             self._initialized = True
-            logger.info("live_trader_initialized")
+
+            # Immediately sync real balance from Polymarket (ignore positions until active market)
+            await self.sync_state(active_token_ids=[])
+
+            # Debug: write balance info to file
+            with open("data/balance_debug.txt", "w") as f:
+                f.write(f"initialized: {self._initialized}\n")
+                f.write(f"bankroll: {self._bankroll}\n")
+                f.write(f"positions: {len(self._positions)}\n")
+
+            logger.info(
+                "live_trader_initialized",
+                usdc_balance=float(self._bankroll),
+                positions=len(self._positions),
+            )
 
         except ImportError:
             raise RuntimeError(
@@ -100,7 +115,7 @@ class LiveTrader(TraderInterface):
 
         start = time.monotonic()
         signed_order = self._client.create_order(order_args)
-        response = self._client.post_order(signed_order, order_type=OrderType.GTC)
+        response = self._client.post_order(signed_order, orderType=OrderType.GTC)
         latency_ms = (time.monotonic() - start) * 1000
 
         order_id = response.get("orderID", response.get("order_id", ""))
@@ -176,8 +191,12 @@ class LiveTrader(TraderInterface):
             return {"usdc": self._bankroll, "positions": {}}
 
         try:
-            balance_wei = self._client.get_balance()
-            usdc = Decimal(str(int(balance_wei))) / Decimal("1000000")
+            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            result = self._client.get_balance_allowance(params)
+            balance_str = result.get("balance", "0") if isinstance(result, dict) else "0"
+            usdc = Decimal(balance_str) / Decimal("1000000")
             return {"usdc": usdc, "positions": {
                 tid: pos.size for tid, pos in self._positions.items()
             }}
@@ -185,43 +204,133 @@ class LiveTrader(TraderInterface):
             logger.error("live_get_balances_failed", error=str(e))
             return {"usdc": self._bankroll, "positions": {}}
 
-    async def sync_state(self) -> None:
+    async def sync_state(self, active_token_ids: Optional[list[str]] = None) -> None:
         """Poll CLOB API for current positions and balance.
 
         Called every order manager cycle to keep bankroll, positions,
         and P&L in sync with the exchange.
+
+        Uses get_balance_allowance for USDC balance (the SDK's correct method)
+        and get_trades to reconstruct open positions from recent fills.
         """
         if not self._initialized:
+            logger.info("sync_state_skipped_not_initialized")
             return
 
         now = time.monotonic()
         if now - self._last_sync_mono < 2.0:
             return
         self._last_sync_mono = now
+        logger.info("sync_state_running")
 
+        # Sync positions from trades (incremental: only fetch new trades)
         try:
-            raw_positions = self._client.get_positions()
-            new_positions: dict[str, Position] = {}
-            for raw in raw_positions:
-                token_id = raw["asset"]["token_id"]
-                condition_id = raw["asset"].get("condition_id", "")
-                size = Decimal(str(raw["size"]))
-                avg_price = Decimal(str(raw["avgPrice"]))
-                if size > 0:
-                    new_positions[token_id] = Position(
-                        token_id=token_id,
-                        outcome="",
-                        size=size,
-                        avg_entry_price=avg_price,
-                        market_condition_id=condition_id,
-                    )
-            self._positions = new_positions
+            from py_clob_client.clob_types import TradeParams
+
+            # Use after= parameter to fetch only trades since last sync
+            if self._last_trade_timestamp is not None:
+                trades = self._client.get_trades(after=self._last_trade_timestamp)
+            else:
+                trades = self._client.get_trades()
+
+            if isinstance(trades, list) and trades:
+                # Track latest timestamp for next incremental fetch
+                for t in trades:
+                    ts = t.get("match_time", t.get("timestamp", 0))
+                    if isinstance(ts, (int, float)) and ts > (self._last_trade_timestamp or 0):
+                        self._last_trade_timestamp = int(ts)
+
+                # On first sync (no cached positions), build from full history
+                # On subsequent syncs, apply incremental updates
+                if not self._positions and self._last_trade_timestamp is None:
+                    # Full rebuild
+                    net: dict[str, dict] = {}
+                    for t in trades:
+                        token_id = t.get("asset_id", "")
+                        if not token_id:
+                            continue
+                        side = t.get("side", "BUY")
+                        size = Decimal(str(t.get("size", "0")))
+                        price = Decimal(str(t.get("price", "0")))
+
+                        if token_id not in net:
+                            net[token_id] = {"size": Decimal("0"), "cost": Decimal("0"), "condition_id": ""}
+
+                        if side == "BUY":
+                            net[token_id]["size"] += size
+                            net[token_id]["cost"] += size * price
+                        else:
+                            net[token_id]["size"] -= size
+                            net[token_id]["cost"] -= size * price
+
+                    new_positions: dict[str, Position] = {}
+                    for token_id, data in net.items():
+                        if active_token_ids is not None and token_id not in active_token_ids:
+                            continue
+                        if data["size"] > 0:
+                            avg_price = data["cost"] / data["size"] if data["size"] > 0 else Decimal("0")
+                            new_positions[token_id] = Position(
+                                token_id=token_id,
+                                outcome="",
+                                size=data["size"],
+                                avg_entry_price=avg_price,
+                                market_condition_id=data["condition_id"],
+                            )
+                    self._positions = new_positions
+                else:
+                    # Incremental update: apply new trades to existing positions
+                    for t in trades:
+                        token_id = t.get("asset_id", "")
+                        if not token_id:
+                            continue
+                        if active_token_ids is not None and token_id not in active_token_ids:
+                            continue
+                        side = t.get("side", "BUY")
+                        size = Decimal(str(t.get("size", "0")))
+                        price = Decimal(str(t.get("price", "0")))
+
+                        existing = self._positions.get(token_id)
+                        if side == "BUY":
+                            if existing:
+                                total_size = existing.size + size
+                                existing.avg_entry_price = (
+                                    (existing.avg_entry_price * existing.size + price * size) / total_size
+                                )
+                                existing.size = total_size
+                            else:
+                                self._positions[token_id] = Position(
+                                    token_id=token_id,
+                                    outcome="",
+                                    size=size,
+                                    avg_entry_price=price,
+                                    market_condition_id="",
+                                )
+                        else:  # SELL
+                            if existing:
+                                existing.size -= size
+                                if existing.size <= 0:
+                                    del self._positions[token_id]
+
         except Exception as e:
             logger.warning("live_sync_positions_failed", error=str(e))
 
+        # Sync USDC balance
         try:
-            balance_wei = self._client.get_balance()
-            self._bankroll = Decimal(str(int(balance_wei))) / Decimal("1000000")
+            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            result = self._client.get_balance_allowance(params)
+            # Debug: append raw response to file
+            with open("data/balance_debug.txt", "a") as f:
+                f.write(f"raw_result_type: {type(result).__name__}\n")
+                f.write(f"raw_result: {result}\n")
+            logger.info(
+                "balance_api_raw_response",
+                result_type=type(result).__name__,
+                result=str(result),
+            )
+            balance_str = result.get("balance", "0") if isinstance(result, dict) else "0"
+            self._bankroll = Decimal(balance_str) / Decimal("1000000")
         except Exception as e:
             logger.warning("live_sync_balance_failed", error=str(e))
 

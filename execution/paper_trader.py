@@ -49,6 +49,31 @@ class PaperTrader(TraderInterface):
         self._shared_state.total_trades = self._total_trades
         self._shared_state.winning_trades = self._winning_trades
 
+    def _record_recent_trade(self, token_id: str, pnl: Decimal, cost: float, side: str = ""):
+        """Record a completed trade for the dashboard's recent trades display."""
+        if self._shared_state is None:
+            return
+        if not side:
+            market = self._shared_state.current_market
+            if market:
+                if token_id == market.token_id_up:
+                    side = "UP"
+                elif token_id == market.token_id_down:
+                    side = "DOWN"
+                else:
+                    side = "?"
+            else:
+                side = "?"
+        self._shared_state.recent_trades.append({
+            "side": side,
+            "pnl": float(pnl),
+            "cost": cost,
+            "won": float(pnl) > 0,
+            "time": time.time(),
+        })
+        if len(self._shared_state.recent_trades) > 5:
+            self._shared_state.recent_trades = self._shared_state.recent_trades[-5:]
+
     async def place_order(
         self,
         token_id: str,
@@ -264,15 +289,16 @@ class PaperTrader(TraderInterface):
 
         if order.side == Side.BUY:
             if existing:
-                # Add to existing position
                 total_size = existing.size + fill_size
                 existing.avg_entry_price = (
                     (existing.avg_entry_price * existing.size + fill_price * fill_size)
                     / total_size
                 )
                 existing.size = total_size
+                await self.db.update_position_size(
+                    token_id, existing.size, existing.avg_entry_price,
+                )
             else:
-                # New position
                 pos = Position(
                     token_id=token_id,
                     outcome="",
@@ -282,7 +308,16 @@ class PaperTrader(TraderInterface):
                 )
                 self._positions[token_id] = pos
 
-            # Deduct cost from bankroll
+                await self.db.insert_position(
+                    token_id=token_id,
+                    market_condition_id=order.market_condition_id,
+                    outcome="",
+                    size=fill_size,
+                    avg_entry_price=fill_price,
+                    is_paper=self.is_paper,
+                    opened_at=timestamp_ms / 1000.0,
+                )
+
             self.bankroll -= fill_price * fill_size
 
         elif order.side == Side.SELL:
@@ -295,13 +330,12 @@ class PaperTrader(TraderInterface):
 
                 existing.size -= close_size
                 if existing.size <= 0:
-                    # Position fully closed — count as one completed trade
                     self._total_trades += 1
                     if pnl > 0:
                         self._winning_trades += 1
+                    self._record_recent_trade(token_id, pnl, float(existing.avg_entry_price * close_size))
                     del self._positions[token_id]
 
-                    # Record position close in DB
                     await self.db.close_position(
                         token_id=token_id,
                         close_price=fill_price,
@@ -313,6 +347,7 @@ class PaperTrader(TraderInterface):
         self,
         winning_token_id: str,
         losing_token_id: str,
+        outcome: str = "",
     ):
         """Handle market resolution — winning shares pay $1, losing pay $0.
 
@@ -335,6 +370,9 @@ class PaperTrader(TraderInterface):
                 pnl=pnl,
                 closed_at=now,
             )
+            cost = float(pos.avg_entry_price * pos.size)
+            win_side = outcome if outcome else "UP"
+            self._record_recent_trade(winning_token_id, pnl, cost, side=win_side)
             del self._positions[winning_token_id]
 
             self._total_trades += 1
@@ -359,6 +397,9 @@ class PaperTrader(TraderInterface):
                 pnl=pnl,
                 closed_at=now,
             )
+            cost = float(pos.avg_entry_price * pos.size)
+            lose_side = "DOWN" if outcome == "UP" else "UP"
+            self._record_recent_trade(losing_token_id, pnl, cost, side=lose_side)
             del self._positions[losing_token_id]
 
             self._total_trades += 1
@@ -378,7 +419,13 @@ class PaperTrader(TraderInterface):
 
     @property
     def equity(self) -> Decimal:
-        """Current equity = bankroll + unrealized value of positions."""
+        """Current equity = bankroll + cost basis of open positions.
+
+        Uses cost basis (size × avg_entry_price), not mark-to-market,
+        because binary markets resolve to $1 or $0. This represents
+        total capital deployed, which is the correct risk measure.
+        For true mark-to-market, each position would need current_market_price.
+        """
         unrealized = sum(
             pos.size * pos.avg_entry_price
             for pos in self._positions.values()

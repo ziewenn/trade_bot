@@ -103,6 +103,7 @@ class Bot:
 
         # 4. Initialize shared state
         self.state = SharedState()
+        self.state.starting_bankroll = self.settings.initial_bankroll
 
         # 5. Initialize feeds
         self.binance_feed = BinanceFeed(
@@ -116,6 +117,8 @@ class Bot:
             gamma_api_url=self.settings.gamma_api_url,
             playwright_fallback=self.settings.anchor_scrape_playwright_fallback,
         )
+        if self.settings.anchor_scrape_playwright_fallback:
+            await self.market_discovery.start_persistent_browser()
 
         # 6. Initialize strategy
         self.strategy = Strategy(self.settings)
@@ -130,6 +133,17 @@ class Bot:
             )
             await live_trader.initialize()
             self.trader = live_trader
+            # Use real equity from Polymarket as starting bankroll
+            real_balance = float(live_trader.current_bankroll)
+            position_cost = sum(
+                float(p.avg_entry_price * p.size) 
+                for p in live_trader.current_positions.values()
+            )
+            total_equity = real_balance + position_cost
+            if total_equity >= 0:
+                self.state.starting_bankroll = total_equity
+                self.settings.initial_bankroll = total_equity
+                logger.info("live_equity_synced", equity=total_equity, cash=real_balance)
         elif self.settings.trading_mode == "sim-live":
             from execution.simulated_live_trader import SimulatedLiveTrader
 
@@ -203,17 +217,17 @@ class Bot:
                     tg.create_task(self.dashboard.run())
                 tg.create_task(self.alerts.start())
 
-                # Web dashboard (for remote monitoring)
-                if self.settings.dashboard_enabled:
-                    from monitoring.web_dashboard import WebDashboard
+                # Web dashboard (always enabled for web UI control)
+                from monitoring.web_dashboard import WebDashboard
 
-                    web = WebDashboard(
-                        self.settings,
-                        self.state,
-                        self.risk_manager,
-                        self.order_manager,
-                    )
-                    tg.create_task(web.run())
+                web = WebDashboard(
+                    self.settings,
+                    self.state,
+                    self.risk_manager,
+                    self.order_manager,
+                    self.alerts,
+                )
+                tg.create_task(web.run())
 
                 # DB maintenance
                 tg.create_task(self._cleanup_loop())
@@ -627,7 +641,39 @@ class Bot:
                 market=old_market.event_slug,
             )
 
-            await self.trader.resolve_market(winning_token, losing_token)
+            # Check positions for P&L alert before resolving
+            total_cost = 0.0
+            total_payout = 0.0
+            had_positions = False
+            for token_id in [winning_token, losing_token]:
+                if token_id in self.state.open_positions:
+                    pos = self.state.open_positions[token_id]
+                    # size is number of shares, avg_entry_price is decimal
+                    cost = float(pos.size * pos.avg_entry_price)
+                    payout = float(pos.size) if token_id == winning_token else 0.0
+                    total_cost += cost
+                    total_payout += payout
+                    had_positions = True
+
+            pnl = total_payout - total_cost
+
+            await self.trader.resolve_market(
+                winning_token, losing_token,
+                outcome="UP" if btc_went_up else "DOWN",
+            )
+
+            # Send Telegram Alert if we had positions
+            if had_positions:
+                emoji = "🎉" if pnl > 0 else ("💀" if pnl < 0 else "😐")
+                status = "WON" if pnl > 0 else ("LOST" if pnl < 0 else "BREAK EVEN")
+                msg = (
+                    f"{emoji} <b>Trade Resolved: {status}</b>\n"
+                    f"Market: {old_market.event_slug}\n"
+                    f"Position Cost: ${total_cost:.2f}\n"
+                    f"Payout: ${total_payout:.2f}\n"
+                    f"Net P&L: <b>${pnl:+.2f}</b>"
+                )
+                asyncio.create_task(self.alerts.send_alert(msg))
 
         except Exception as e:
             logger.error(
@@ -951,6 +997,24 @@ class Bot:
             try:
                 await self.db.flush()
                 flush_count += 1
+
+                # Save daily stats every flush
+                from datetime import datetime, timezone
+                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                equity = float(self.state.paper_bankroll) + sum(
+                    float(p.avg_entry_price * p.size)
+                    for p in self.state.open_positions.values()
+                )
+                await self.db.upsert_daily_stats(
+                    date_str=today,
+                    total_trades=self.state.total_trades,
+                    winning_trades=self.state.winning_trades,
+                    total_pnl=self.state.session_pnl,
+                    max_drawdown=Decimal(str(round(self.risk_manager.drawdown_from_peak, 6))),
+                    peak_equity=Decimal(str(round(self.risk_manager.risk_state.peak_equity, 2))),
+                    closing_equity=Decimal(str(round(equity, 2))),
+                    is_paper=self.settings.trading_mode != "live",
+                )
 
                 # Purge price ticks older than 24 hours every 10 flushes (~5 min)
                 if flush_count % 10 == 0:

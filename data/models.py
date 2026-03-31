@@ -145,6 +145,7 @@ class Trade:
 class RiskState:
     bankroll: float
     peak_equity: float
+    starting_equity: float
     daily_pnl: float
     daily_pnl_reset_utc: str
     open_positions: dict[str, Position] = field(default_factory=dict)

@@ -26,9 +26,9 @@ uvicorn[standard]>=0.27
 jinja2>=3.1
 python-multipart>=0.0.6
 
-# Optional: anchor scraping via JS rendering (set ANCHOR_SCRAPE_PLAYWRIGHT_FALLBACK=true)
-# Install browser with: playwright install chromium
-# playwright>=1.40
+# Anchor scraping via JS rendering (set ANCHOR_SCRAPE_PLAYWRIGHT_FALLBACK=true in .env)
+# Browser: run `playwright install chromium` after pip install
+playwright>=1.40
 
 # Testing
 pytest>=8.0

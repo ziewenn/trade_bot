@@ -249,12 +249,12 @@ class TestSignalGeneration:
         assert signal is None
 
     def test_no_signal_small_price_gap(self, settings):
-        """Should not trade when max(binance, chainlink) gap is below minimum ($50)."""
+        """Should not trade when max(binance, chainlink) gap is below minimum ($20)."""
         strategy = Strategy(settings)
         state = self._make_state_with_market(
             anchor=Decimal("100000"),
-            binance=Decimal("100030"),  # Only $30 gap — below $50 min
-            chainlink=Decimal("100020"),  # Also small — max(30, 20) = $30 < $50
+            binance=Decimal("100010"),  # Only $10 gap — below $20 min
+            chainlink=Decimal("100005"),  # Also small — max(10, 5) = $10 < $20
         )
         signal = strategy.generate_signal(state, 1000.0)
         assert signal is None

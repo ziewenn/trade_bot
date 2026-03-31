@@ -77,6 +77,7 @@ class Dashboard:
         layout["right"].split_column(
             Layout(name="positions", size=8),
             Layout(name="risk", size=8),
+            Layout(name="recent_trades", size=9),
             Layout(name="stats", size=9),
         )
 
@@ -86,6 +87,7 @@ class Dashboard:
         layout["orders"].update(self._orders_panel())
         layout["positions"].update(self._positions_panel())
         layout["risk"].update(self._risk_panel())
+        layout["recent_trades"].update(self._recent_trades_panel())
         layout["stats"].update(self._stats_panel())
         layout["footer"].update(self._footer_panel())
 
@@ -103,8 +105,12 @@ class Dashboard:
         poly_status = "[green]OK[/]" if self.state.polymarket_connected else "[red]DOWN[/]"
         chain_status = "[green]OK[/]" if self.state.chainlink_connected else "[red]DOWN[/]"
 
+        paused = getattr(self.state, 'trading_paused', False)
+        trading_status = "[red bold]PAUSED[/]" if paused else "[green bold]ACTIVE[/]"
+
         text = (
             f"  [{mode_color}]{mode} MODE[/]  |  "
+            f"Trading: {trading_status}  |  "
             f"Uptime: {hours:02d}:{minutes:02d}:{seconds:02d}  |  "
             f"Binance: {binance_status}  Polymarket: {poly_status}  Chainlink: {chain_status}"
         )
@@ -301,21 +307,65 @@ class Dashboard:
         rs = self.risk.risk_state
         halt_text = f"[red bold]HALTED: {rs.halt_reason}[/]" if rs.is_halted else "[green]Active[/]"
 
-        # Use paper bankroll if synced, otherwise fall back to risk state
-        bankroll = float(self.state.paper_bankroll) if self.state.paper_bankroll > 0 else rs.bankroll
-        daily_pnl = float(self.state.session_pnl)
-        daily_pnl_color = "green" if daily_pnl >= 0 else "red"
+        # Cash = paper_bankroll, Equity = cash + position cost (at entry)
+        cash = float(self.state.paper_bankroll) if self.state.paper_bankroll > 0 else rs.bankroll
+        position_cost = sum(
+            float(p.avg_entry_price * p.size)
+            for p in self.state.open_positions.values()
+        )
+        equity = cash + position_cost
+        starting = self.state.starting_bankroll
+        actual_pnl = equity - starting
+        actual_pnl_color = "green" if actual_pnl >= 0 else "red"
+        realized_pnl = float(self.state.session_pnl)
+        realized_pnl_color = "green" if realized_pnl >= 0 else "red"
         drawdown = self.risk.drawdown_from_peak
         drawdown_color = "red" if drawdown > self.settings.drawdown_halt_pct * 0.5 else "yellow"
 
         rows = [
             f"  Status:     {halt_text}",
-            f"  Bankroll:   ${bankroll:,.2f}",
-            f"  Daily P&L:  [{daily_pnl_color}]${daily_pnl:+,.2f}[/]  (limit: ${bankroll * self.settings.daily_loss_limit_pct:,.2f})",
+            f"  Equity:     ${equity:,.2f}  [dim](cash: ${cash:,.2f})[/]",
+            f"  Started:    ${starting:,.2f}",
+            f"  Total P&L:  [{actual_pnl_color}]${actual_pnl:+,.2f}[/]  ({actual_pnl/starting*100 if starting > 0 else 0:+,.1f}%)",
+            f"  Realized:   [{realized_pnl_color}]${realized_pnl:+,.2f}[/]",
             f"  Drawdown:   [{drawdown_color}]{drawdown:.2%}[/]  (halt: {self.settings.drawdown_halt_pct:.0%})",
             f"  Exposure:   {self.risk.exposure_pct:.1%}  (max: {self.settings.max_concurrent_exposure_pct:.0%})",
         ]
         return Panel("\n".join(rows), title="Risk")
+
+    def _recent_trades_panel(self) -> Panel:
+        table = Table(show_header=True, header_style="bold", expand=True, padding=(0, 1))
+        table.add_column("Side", width=5)
+        table.add_column("Result", width=6)
+        table.add_column("P&L", width=10)
+        table.add_column("Cost", width=8)
+        table.add_column("Ago", width=8)
+
+        trades = self.state.recent_trades
+        for trade in reversed(trades):
+            side_color = "green" if trade["side"] == "UP" else "red" if trade["side"] == "DOWN" else "dim"
+            result = "WIN" if trade["won"] else "LOSS"
+            result_color = "green" if trade["won"] else "red"
+            pnl = trade["pnl"]
+            pnl_color = "green" if pnl >= 0 else "red"
+            ago = int(time.time() - trade["time"])
+            if ago < 60:
+                ago_str = f"{ago}s"
+            else:
+                ago_str = f"{ago // 60}m"
+
+            table.add_row(
+                f"[{side_color}]{trade['side']}[/]",
+                f"[{result_color}]{result}[/]",
+                f"[{pnl_color}]${pnl:+,.2f}[/]",
+                f"${trade['cost']:,.2f}",
+                ago_str,
+            )
+
+        if not trades:
+            table.add_row("[dim]-[/]", "[dim]-[/]", "[dim]-[/]", "[dim]-[/]", "[dim]-[/]")
+
+        return Panel(table, title=f"Recent Trades ({len(trades)})")
 
     def _stats_panel(self) -> Panel:
         total = self.state.total_trades
@@ -337,7 +387,8 @@ class Dashboard:
 
     def _footer_panel(self) -> Panel:
         now = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-        return Panel(f"  {now}  |  Ctrl+C to stop", style="dim")
+        web_url = f"http://{self.settings.dashboard_host}:{self.settings.dashboard_port}"
+        return Panel(f"  {now}  |  Web UI: [bold cyan]{web_url}[/]  |  Ctrl+C to stop", style="dim")
 
     @staticmethod
     def _probability_bar(prob: float, width: int = 20) -> str:

@@ -92,7 +92,13 @@ class OrderManager:
                         active_orders=len(self._active_orders),
                     )
                     last_heartbeat = start
-                await self.trader.sync_state()
+                active_tokens = []
+                if self.state.current_market:
+                    active_tokens = [
+                        self.state.current_market.token_id_up,
+                        self.state.current_market.token_id_down,
+                    ]
+                await self.trader.sync_state(active_tokens)
                 self.bankroll = float(self.trader.current_bankroll)
 
                 self.state.open_positions = self.trader.current_positions
@@ -100,27 +106,33 @@ class OrderManager:
                 self.state.session_pnl = self.trader.current_pnl
 
                 if self._risk_manager:
-                    self._risk_manager.update_equity(self.bankroll)
                     total_exposure = sum(
                         float(p.size * p.avg_entry_price)
                         for p in self.trader.current_positions.values()
                     )
+                    equity = self.bankroll + total_exposure
+                    self._risk_manager.update_equity(equity)
                     self._risk_manager.update_exposure(total_exposure)
 
-                signal = self.strategy.generate_signal(self.state, self.bankroll)
-
-                # Check if we should exit positions
-                if self.strategy.should_exit(self.state):
-                    await self._exit_all_positions()
-                    self._current_signal = None
-                elif signal:
-                    await self._update_orders(signal)
-                    self._current_signal = signal
-                else:
-                    # No signal — cancel stale orders
+                if self.state.trading_paused:
                     if self._active_orders:
                         await self.cancel_all()
                     self._current_signal = None
+                else:
+                    signal = self.strategy.generate_signal(self.state, self.bankroll)
+
+                    # Check if we should exit positions
+                    if self.strategy.should_exit(self.state):
+                        await self._exit_all_positions()
+                        self._current_signal = None
+                    elif signal:
+                        await self._update_orders(signal)
+                        self._current_signal = signal
+                    else:
+                        # No signal — cancel stale orders
+                        if self._active_orders:
+                            await self.cancel_all()
+                        self._current_signal = None
 
             except Exception as e:
                 logger.error(
@@ -173,6 +185,17 @@ class OrderManager:
         await self._post_limiter.acquire()
 
         try:
+            if self._risk_manager:
+                total_exposure = sum(
+                    float(p.size * p.avg_entry_price)
+                    for p in self.trader.current_positions.values()
+                )
+                current_equity = self.bankroll + total_exposure
+                is_allowed = await self._risk_manager.check_pre_trade(signal, current_equity)
+                if not is_allowed:
+                    logger.debug("pre_trade_rejected")
+                    return
+
             market = self.state.current_market
             condition_id = market.condition_id if market else ""
 

@@ -24,10 +24,11 @@ class RiskManager:
         self.risk_state = RiskState(
             bankroll=settings.initial_bankroll,
             peak_equity=settings.initial_bankroll,
+            starting_equity=settings.initial_bankroll,
             daily_pnl=0.0,
             daily_pnl_reset_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         )
-
+        self._peak_initialized = False
         self._on_halt_callback: Optional[Callable[[str], Awaitable[None]]] = None
 
     def set_halt_callback(self, callback: Callable[[str], Awaitable[None]]):
@@ -53,6 +54,10 @@ class RiskManager:
             return False
 
         # 3. Per-trade cap
+        # trade_value = dollar cost of this trade
+        # signal.kelly_size = number of shares (converted from dollars in strategy.py)
+        # signal.price = cost per share
+        # So: shares × price_per_share = total dollar cost
         trade_value = float(signal.kelly_size) * float(signal.price)
         max_trade = self.risk_state.bankroll * self.settings.max_position_pct
         if trade_value > max_trade:
@@ -63,7 +68,9 @@ class RiskManager:
             )
             return False
 
-        # 4. Concurrent exposure cap
+        # 4. Concurrent exposure cap (all values in dollar terms)
+        # risk_state.total_exposure is set by order_manager as sum(p.size * p.avg_entry_price)
+        # trade_value above is also in dollars — units are consistent
         total_exposure = self.risk_state.total_exposure + trade_value
         max_exposure = self.risk_state.bankroll * self.settings.max_concurrent_exposure_pct
         if total_exposure > max_exposure:
@@ -175,6 +182,12 @@ class RiskManager:
 
     def update_equity(self, current_equity: float):
         """Update peak equity and bankroll tracking."""
+        if not self._peak_initialized and current_equity > 0:
+            self.risk_state.peak_equity = current_equity
+            self.risk_state.starting_equity = current_equity
+            self._peak_initialized = True
+            logger.info("equity_initialized_from_exchange", initial_equity=current_equity)
+            
         self.risk_state.bankroll = current_equity
         if current_equity > self.risk_state.peak_equity:
             self.risk_state.peak_equity = current_equity
@@ -189,10 +202,10 @@ class RiskManager:
         return self.risk_state.daily_pnl >= -limit
 
     def _check_drawdown(self, current_equity: float) -> bool:
-        """Check if drawdown from peak exceeds threshold."""
-        if self.risk_state.peak_equity <= 0:
+        """Check if drawdown from session baseline exceeds threshold."""
+        if self.risk_state.starting_equity <= 0:
             return True
-        drawdown = 1.0 - (current_equity / self.risk_state.peak_equity)
+        drawdown = 1.0 - (current_equity / self.risk_state.starting_equity)
         return drawdown < self.settings.drawdown_halt_pct
 
     def _check_daily_reset(self):
@@ -239,9 +252,9 @@ class RiskManager:
 
     @property
     def drawdown_from_peak(self) -> float:
-        if self.risk_state.peak_equity <= 0:
+        if self.risk_state.starting_equity <= 0:
             return 0.0
-        return 1.0 - (self.risk_state.bankroll / self.risk_state.peak_equity)
+        return 1.0 - (self.risk_state.bankroll / self.risk_state.starting_equity)
 
     @property
     def exposure_pct(self) -> float:

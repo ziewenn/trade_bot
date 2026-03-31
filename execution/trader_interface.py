@@ -52,7 +52,7 @@ class TraderInterface(ABC):
         """Session realized P&L. Override in subclasses."""
         return Decimal("0")
 
-    async def sync_state(self) -> None:
+    async def sync_state(self, active_token_ids: Optional[list[str]] = None) -> None:
         """Refresh local state from the exchange (positions, bankroll).
 
         No-op for paper/sim-live (state is tracked in-memory).

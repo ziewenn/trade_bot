@@ -23,23 +23,23 @@ class Settings(BaseSettings):
     telegram_chat_id: Optional[str] = None
 
     # Risk parameters
-    initial_bankroll: float = 20.0
+    initial_bankroll: float = 50.0
     max_position_pct: float = 0.02
     daily_loss_limit_pct: float = 0.03
     drawdown_halt_pct: float = 0.08
     kelly_fraction: float = 0.25
-    min_edge_pct: float = 0.02
+    min_edge_pct: float = 0.05
     max_concurrent_exposure_pct: float = 0.15
 
     # Strategy parameters
     binance_price_lookback_ms: int = 5000
     momentum_threshold_pct: float = 0.0003
     order_offset_cents: float = 0.01
-    cancel_replace_interval_ms: int = 500
-    market_entry_window_sec: int = 240  # Trade within first 4 min of 5-min window
-    market_entry_min_elapsed_sec: int = 180  # Don't enter before 3 min elapsed
+    cancel_replace_interval_ms: int = 500  # 500→1500: reduced API load for small bankroll
+    market_entry_window_sec: int = 300  # Allow entry for entire 5-min cycle (exit_buffer still applies)
+    market_entry_min_elapsed_sec: int = 0  # No minimum elapsed time restriction
     market_exit_buffer_sec: int = 30
-    min_price_gap_usd: float = 50.0  # Min price gap (max of binance/chainlink) to trade
+    min_price_gap_usd: float = 20.0  # Min price gap (max of binance/chainlink) to trade
     binance_prediction_weight: float = 0.4  # Blend weight: 0=Chainlink only, 1=Binance only
 
     # Stale data thresholds
@@ -85,9 +85,9 @@ class Settings(BaseSettings):
     sim_slippage_cents: float = 0.015   # 1.5¢ slippage (vs 0.5¢ paper)
 
     # Web dashboard
-    dashboard_enabled: bool = False
+    dashboard_enabled: bool = True
     dashboard_port: int = 8080
-    dashboard_host: str = "0.0.0.0"
+    dashboard_host: str = "127.0.0.1"
     dashboard_password: str = "changeme"
 
     @model_validator(mode="after")
@@ -101,8 +101,8 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "POLYMARKET_FUNDER_ADDRESS is required for live trading mode"
                 )
-            if self.dashboard_enabled and self.dashboard_password == "changeme":
+            if self.dashboard_password == "changeme":
                 raise ValueError(
-                    "DASHBOARD_PASSWORD must be changed from default 'changeme' in live mode"
+                    "DASHBOARD_PASSWORD must be changed from default 'changeme' in live mode for the web UI"
                 )
         return self
