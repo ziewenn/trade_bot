@@ -44,12 +44,12 @@ class RiskManager:
         self._check_daily_reset()
 
         # 1. Daily loss limit
-        if not self._check_daily_loss():
+        if self.settings.trading_mode == "live" and not self._check_daily_loss():
             await self._trigger_halt("daily_loss_limit_exceeded")
             return False
 
         # 2. Drawdown halt
-        if not self._check_drawdown(current_equity):
+        if self.settings.trading_mode == "live" and not self._check_drawdown(current_equity):
             await self._trigger_halt("drawdown_halt_triggered")
             return False
 
